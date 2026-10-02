@@ -1,2 +1,3 @@
 # parallelazy
-A lightweight, topic-based pub/sub worker system using spawn and pipes, spawn based, pytorch/CUDA ready.
+
+A python lightweight, plugin/worker framework, with topic-based pub/sub and shared env using spawn and pipes, pytorch and CUDA ready.
