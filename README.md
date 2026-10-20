@@ -19,8 +19,7 @@ python -m pip install .
 ```python
 import time
 
-from parallelazy.plugin import Plugin
-from parallelazy.plugin_manager import PluginManager
+from parallelazy import Plugin, PluginManager
 
 
 class Worker(Plugin):
