@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parallelazy"
+version = "0.0.1"
+description = "A lightweight multiprocess worker-plugin framework. Topic-based pub/sub, global enviroment, using process spawn and pipes, pytorch and CUDA ready."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "Cesare Montresor" }
+]
+
+dependencies = [
+    "debugpy",
+    "torch"
+]
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["parallelazy*"]
+
+
+[project.urls]
+Homepage = "https://github.com/cesare-montresor/parallelazy"
+Repository = "https://github.com/cesare-montresor/parallelazy"
+Issues = "https://github.com/cesare-montresor/parallelazy/issues"
