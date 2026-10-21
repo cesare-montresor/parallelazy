@@ -11,7 +11,12 @@ A lightweight Python plugin/worker framework with:
 ## Install
 
 ```bash
-python -m pip install .
+pip install parallelazy
+```
+
+*for development*
+```bash
+pip install -e .
 ```
 
 ## Debug in VSCode
