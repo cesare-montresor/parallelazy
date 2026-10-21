@@ -52,7 +52,8 @@ class PluginManager:
     def __init__(
         self,
         timeout_request: float = 5.0,
-        timeout_start: float = 5.0,
+        timeout_start: float = 10.0,
+        timeout_start_debug: float = 30.0,
         worker_pydebug: bool = None
     ):
         """
@@ -61,6 +62,7 @@ class PluginManager:
         Args:
             timeout_request: Default timeout for sync requests (seconds)
             timeout_start: Timeout for start command (seconds)
+            timeout_start_debug: Timeout for start command in debug mode (seconds)
             worker_pydebug: Whether to enable pydebug for worker processes (optional, for debugging plugins)
         """
         self._plugins: Dict[str, PluginInfo] = {}  # plugin_id -> PluginInfo
@@ -73,8 +75,9 @@ class PluginManager:
         self._env = EnvironmentManager()
         
         self.timeout_request = timeout_request
-        self.timeout_start = timeout_start
         self.worker_pydebug = False if worker_pydebug is None else bool(worker_pydebug)
+        self.timeout_start = timeout_start if not self.worker_pydebug else timeout_start_debug
+        
 
 
     def load_plugins(self, descriptors: List[PluginDescriptor], parallel: bool = True) -> None:
@@ -150,10 +153,16 @@ class PluginManager:
             )
             
             process.start()
-            is_ready = initialized.wait(timeout=self.timeout_start)
+            is_ready = False
+            while process.is_alive():
+                is_ready = initialized.wait(timeout=self.timeout_start)
+                if is_ready: break
+                # If we get here, wait() timed out but the process is still alive
+                logger.info(f"Plugin {plugin_id} is still initializing (waiting...)")
+
+            # If the loop exited and is_ready is False, the process died before setting the event
             if not is_ready:
-                logger.error(f"Plugin {plugin_id} failed to initialize within {self.timeout_start} seconds")
-                process.terminate()
+                logger.error(f"Plugin {plugin_id} failed to initialize (process terminated unexpectedly).")
                 return False
 
             logger.info(f"Plugin {plugin_id} loaded")
