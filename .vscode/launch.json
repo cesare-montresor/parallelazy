@@ -1,0 +1,57 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Example: Configuration",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "examples/example_configuration.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug Example: Environment Variables",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "examples/example_env_variables.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug Example: Error Handling",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "examples/example_error_handling.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug Example: Graceful Shutdown",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "examples/example_graceful_shutdown.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug Example: Pub/Sub Communication",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "examples/example_pubsub.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug Example: RPC Calls",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "examples/example_rpc_calls.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug Example: Worker Pool Management",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "examples/example_worker_pool.py",
+            "console": "integratedTerminal"
+        }
+    ]
+}

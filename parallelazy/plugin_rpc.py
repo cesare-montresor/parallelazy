@@ -52,7 +52,7 @@ class PluginCoreRPC:
     """
 
     
-    def __init__(self, plugin_id: str, channel: Channel=None, timeout: float = 5.0):
+    def __init__(self, plugin_id: str, channel: Channel=None, timeout: float = 5.0, start_listener: bool = True):
         """
         Initialize manager proxy.
         
@@ -77,13 +77,20 @@ class PluginCoreRPC:
         
         # Reader thread routes Responses to reply slots
         self._reader = threading.Thread(target=self._channel_listener, daemon=False)
-        self._reader.start()
+                
 
         # Persistent pool for executing incoming requests — avoids spawning
         # a fresh OS thread per RPC call (was the source of the stutter).
         self._executor = ThreadPoolExecutor(
             max_workers=8, thread_name_prefix=f"rpc-{plugin_id}"
         )
+
+        if start_listener:
+            self.start_listener()
+
+    def start_listener(self):
+        if not self._reader.is_alive():
+            self._reader.start()
 
     def shutdown(self):
         """Clean up resources."""
@@ -220,7 +227,7 @@ class PluginCoreRPC:
 
             self._executor.submit(self._execute_command, req)
         except Exception as e:
-            logger.error(f"Request handler error: {e}", exc_info=True)
+            logger.error(f"Request handler error: {req} {e}", exc_info=True)
             self.respond(req, error=e)
     
     def _handle_response(self, resp: Response) -> bool:

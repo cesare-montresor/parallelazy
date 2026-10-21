@@ -7,11 +7,9 @@ without any external dependencies.
 
 import logging
 from typing import Any, Dict
-
-from parallelazy.plugin import Plugin, PluginDescriptor
-from parallelazy.plugin_worker import PluginWorker
 import time
-from parallelazy.plugin_manager import PluginManager
+
+from parallelazy import Plugin, PluginDescriptor, PluginWorker, PluginManager
 
 
 

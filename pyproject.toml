@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parallelazy"
-version = "0.0.2"
+version = "0.0.4"
 description = "A lightweight multiprocess worker-plugin framework. Topic-based pub/sub, global enviroment, using process spawn and pipes, pytorch and CUDA ready."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -14,7 +14,8 @@ authors = [
 
 dependencies = [
     "debugpy",
-    "torch"
+    "torch",
+    "numpy"
 ]
 
 

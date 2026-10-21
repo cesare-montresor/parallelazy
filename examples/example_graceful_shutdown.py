@@ -12,9 +12,8 @@ import sys
 import time
 from typing import Any, Dict
 
-from parallelazy.plugin import Plugin, PluginDescriptor
-from parallelazy.plugin_worker import PluginWorker
-from parallelazy.plugin_manager import PluginManager
+
+from parallelazy import Plugin, PluginDescriptor, PluginWorker, PluginManager
 
 # Configure logging for clear shutdown verification
 logging.basicConfig(

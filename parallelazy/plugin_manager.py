@@ -150,7 +150,11 @@ class PluginManager:
             )
             
             process.start()
-            initialized.wait(timeout=self.timeout_start)
+            is_ready = initialized.wait(timeout=self.timeout_start)
+            if not is_ready:
+                logger.error(f"Plugin {plugin_id} failed to initialize within {self.timeout_start} seconds")
+                process.terminate()
+                return False
 
             logger.info(f"Plugin {plugin_id} loaded")
             return True

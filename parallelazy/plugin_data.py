@@ -17,7 +17,6 @@ Message Flows:
 No Commands/Responses wrappers, no double indirection. Just Request and Response.
 """
 from typing import Any, Callable, Optional, TYPE_CHECKING
-from enum import Enum
 import logging
 from concurrent.futures import Future
 from torch import multiprocessing as mp

@@ -128,11 +128,14 @@ class PluginWorker:
 
         # Create manager proxy for direct manager access+
         channel = Channel(queue_descriptor)
-        self.rpc = PluginRPC(self.plugin_id, channel)
+        self.rpc = PluginRPC(self.plugin_id, channel, start_listener=False)
 
-        self._init_plugin()
         self._init_rpc()
         
+        self._init_plugin()
+        
+        
+        self.rpc.start_listener()  # Start the RPC listener after initialization
 
 
     ## ========================================================================
