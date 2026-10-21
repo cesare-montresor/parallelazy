@@ -14,13 +14,18 @@ A lightweight Python plugin/worker framework with:
 python -m pip install .
 ```
 
+## Debug in VSCode
+
+Due to a known issue with debugpy and spawn ( as opposite to fork ) processes, a small companion vscode extension has been developed in order to enable debugging.
+
+https://marketplace.visualstudio.com/items?itemName=CesareMontresor.parallelazy-vscode
+
 ## Quick start
 
 ```python
 import time
 
-from parallelazy.plugin import Plugin
-from parallelazy.plugin_manager import PluginManager
+from parallelazy import Plugin, PluginManager
 
 
 class Worker(Plugin):
