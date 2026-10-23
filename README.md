@@ -1,5 +1,7 @@
 # parallelazy
 
+[PyPi parallelazy](https://pypi.org/project/parallelazy/)
+
 A lightweight Python plugin/worker framework with:
 
 - isolated plugin processes started with `spawn`;
