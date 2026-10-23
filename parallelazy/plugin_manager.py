@@ -13,10 +13,10 @@ import torch.multiprocessing as mp
 import time
 from typing import Any, Dict, List, Optional
 
-from parallelazy.utils import process_start_spawn
+from parallelazy.utils import is_debugging_enabled, is_debugpy_attached, process_start_spawn
 from parallelazy.plugin import PluginDescriptor
 from parallelazy.plugin_rpc import PluginRPC, RequestEnvGetAll, RequestEnvUnsubscribe, RequestTopicAnnounce
-from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicSubscribe, RequestTopicUnsubscribe
+from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicSubscribe, RequestTopicUnsubscribe, setup_worker_debugging_env
 from parallelazy.plugin_data import  CommandType, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, Subscriber
 from parallelazy.environment_manager import EnvironmentManager
 
@@ -53,8 +53,7 @@ class PluginManager:
         self,
         timeout_request: float = 5.0,
         timeout_start: float = 10.0,
-        timeout_start_debug: float = 30.0,
-        worker_pydebug: bool = None
+        timeout_start_debug: float = 30.0
     ):
         """
         Initialize plugin manager.
@@ -63,7 +62,6 @@ class PluginManager:
             timeout_request: Default timeout for sync requests (seconds)
             timeout_start: Timeout for start command (seconds)
             timeout_start_debug: Timeout for start command in debug mode (seconds)
-            worker_pydebug: Whether to enable pydebug for worker processes (optional, for debugging plugins)
         """
         self._plugins: Dict[str, PluginInfo] = {}  # plugin_id -> PluginInfo
         self._plugins_lock = threading.Lock()  # For thread-safe plugin management
@@ -75,9 +73,12 @@ class PluginManager:
         self._env = EnvironmentManager()
         
         self.timeout_request = timeout_request
-        self.worker_pydebug = False if worker_pydebug is None else bool(worker_pydebug)
+        self.worker_pydebug = is_debugpy_attached()
         self.timeout_start = timeout_start if not self.worker_pydebug else timeout_start_debug
-        
+
+
+        if self.worker_pydebug:
+            setup_worker_debugging_env()
 
 
     def load_plugins(self, descriptors: List[PluginDescriptor], parallel: bool = True) -> None:
@@ -139,7 +140,7 @@ class PluginManager:
             # Spawn worker process
             process = mp.Process(
                 target=PluginWorker.run,
-                args=(plugin_id, descriptor.to_dict(), options, worker_channel, initialized, self.worker_pydebug ),
+                args=(plugin_id, descriptor.to_dict(), options, worker_channel, initialized), 
                 name=f"plugin-{plugin_id}"
             )
             

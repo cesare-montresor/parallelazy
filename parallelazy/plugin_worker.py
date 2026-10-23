@@ -18,7 +18,7 @@ import threading
 import time
 
 
-from parallelazy.utils import init_debugger, process_start_spawn
+from parallelazy.utils import init_debugger, is_debugging_enabled, process_start_spawn, setup_worker_debugging_env
 from parallelazy.plugin_data import  Channel, CommandType, Queue,QueueDescriptor, PendingRequest, PluginStatus,  RequestPluginErrors, RequestPluginStart, RequestPluginStatus, RequestPluginStop, RequestTopicList, Subscriber, Subscription
 from parallelazy.plugin import Plugin, PluginDescriptor, PluginState
 
@@ -59,8 +59,7 @@ class PluginWorker:
         descriptor_dict: Dict[str, Any],
         options: Dict[str, Any],
         queue_descriptor: QueueDescriptor,
-        initialized: Event,
-        pydebug: bool = False 
+        initialized: Event
     ) -> None:
         """
         Entry point for plugin subprocess.
@@ -72,9 +71,10 @@ class PluginWorker:
             queue_descriptor: Queue descriptor for communication
             initialized: Event to signal initialization completion
         """
-        if pydebug:
+        if is_debugging_enabled():
             logger.setLevel(logging.DEBUG)
             init_debugger(plugin_id)
+
             
         worker = PluginWorker(
             plugin_id,
