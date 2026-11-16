@@ -221,3 +221,5 @@ class Plugin:
     def plugin_call(self, plugin_id: str, method_name: str, *args, **kwargs) -> Any:
         """Call a method provided by the manager or another plugin."""
         return self._worker.plugin_call(plugin_id, method_name, *args, **kwargs)
+
+    

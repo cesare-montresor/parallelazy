@@ -13,7 +13,7 @@ import torch.multiprocessing as mp
 import time
 from typing import Any, Dict, List, Optional
 
-from parallelazy.utils import is_debugging_enabled, is_debugpy_attached, process_start_spawn
+from parallelazy.utils import is_debugpy_attached, process_start_spawn
 from parallelazy.plugin import PluginDescriptor
 from parallelazy.plugin_rpc import PluginRPC, RequestEnvGetAll, RequestEnvUnsubscribe, RequestTopicAnnounce
 from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicSubscribe, RequestTopicUnsubscribe, setup_worker_debugging_env

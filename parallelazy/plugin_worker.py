@@ -33,6 +33,7 @@ from typing import Any, Callable, Dict,  Optional, TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
 
+
 # ============================================================================
 # PLUGIN WORKER
 # ============================================================================
@@ -91,7 +92,8 @@ class PluginWorker:
         descriptor_dict: Dict[str, Any],
         options: Dict[str, Any],
         queue_descriptor: QueueDescriptor,
-        initialized: Event
+        initialized: Event,
+        loglevel: int = logging.INFO
     ):
         """Initialize worker."""
 
@@ -100,6 +102,8 @@ class PluginWorker:
         self.options = options
         self._is_running = False
         self._initialized: Event = initialized
+        self.loglevel = loglevel
+        logger.setLevel(loglevel)
         
         self.did_start = threading.Event()
         self.did_start.clear()
@@ -146,7 +150,7 @@ class PluginWorker:
         """Main event loop: wait for requests and topic messages."""
         logger.info(f"Plugin {self.plugin_id} worker started")
         cmds = list(self.rpc.command_handlers.keys())
-        logger.info(f"Plugin {self.plugin_id} registered commands: {cmds}")
+        logger.debug(f"Plugin {self.plugin_id} registered commands: {cmds}")
 
         
         self._initialized.set()  # Signal to manager that initialization is complete
