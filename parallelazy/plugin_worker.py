@@ -267,8 +267,10 @@ class PluginWorker:
             > method
         
 
+            + PLUGIN_LOAD = "plugin_load"
             + PLUGIN_START = "plugin_start"
             + PLUGIN_STOP = "plugin_stop"
+            + PLUGIN_UNLOAD = "plugin_unload"
             + PLUGIN_STATUS = "plugin_status"
             - PLUGIN_STATUS_ALL = "plugin_status_all"
             + PLUGIN_ERRORS = "plugin_errors"
@@ -311,8 +313,10 @@ class PluginWorker:
     # ========================================================================
     
     """Commands that plugin can send to manager or other plugins.
+        + PLUGIN_LOAD = "plugin_load"
         + PLUGIN_START = "plugin_start"
         + PLUGIN_STOP = "plugin_stop"
+        + PLUGIN_UNLOAD = "plugin_unload"
         + PLUGIN_STATUS = "plugin_status"
         - PLUGIN_STATUS_ALL = "plugin_status_all"
         + PLUGIN_ERRORS = "plugin_errors"
@@ -329,6 +333,59 @@ class PluginWorker:
             logger.error(f"Error calling plugin method '{method_name}': {response.error}")
             self.error_log.append(str(response.error))
             return None
+        return response.result
+
+    def plugin_load(
+        self,
+        descriptor: PluginDescriptor,
+        options: Dict[str, Any] = None,
+        wait: bool = True
+    ) -> PendingRequest | bool:
+        """Ask the manager to load a plugin instance described by descriptor."""
+        pending = self.rpc.plugin_load(descriptor, options)
+        if not wait:
+            return pending
+        response = pending.wait()
+        if response.error:
+            logger.error(f"Error loading plugin '{descriptor.name}': {response.error}")
+            self.error_log.append(str(response.error))
+            return False
+        return response.result
+
+    def plugin_start(self, plugin_id: str, wait: bool = True) -> PendingRequest | bool:
+        """Ask the manager to start another plugin."""
+        pending = self.rpc.plugin_start(plugin_id)
+        if not wait:
+            return pending
+        response = pending.wait()
+        if response.error:
+            logger.error(f"Error starting plugin: {response.error}")
+            self.error_log.append(str(response.error))
+            return False
+        return response.result
+
+    def plugin_stop(self, plugin_id: str, wait: bool = True) -> PendingRequest | bool:
+        """Ask the manager to stop another plugin."""
+        pending = self.rpc.plugin_stop(plugin_id)
+        if not wait:
+            return pending
+        response = pending.wait()
+        if response.error:
+            logger.error(f"Error stopping plugin: {response.error}")
+            self.error_log.append(str(response.error))
+            return False
+        return response.result
+
+    def plugin_unload(self, plugin_id: str, wait: bool = True) -> PendingRequest | bool:
+        """Ask the manager to unload another plugin."""
+        pending = self.rpc.plugin_unload(plugin_id)
+        if not wait:
+            return pending
+        response = pending.wait()
+        if response.error:
+            logger.error(f"Error unloading plugin: {response.error}")
+            self.error_log.append(str(response.error))
+            return False
         return response.result
 
 

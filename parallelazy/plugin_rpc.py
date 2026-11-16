@@ -8,7 +8,7 @@ from torch import multiprocessing as mp
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.connection import wait
-from parallelazy.plugin_data import Channel, CommandType, Message, PendingRequest, Queue, Request, RequestCallback, RequestEnvGet, RequestEnvGetAll, RequestEnvSet, RequestEnvSubscribe, RequestEnvUnsubscribe, RequestEnvUpdate, RequestPluginCall, RequestPluginErrors, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestTopicAnnounce, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe, Response, Subscriber
+from parallelazy.plugin_data import Channel, CommandType, Message, PendingRequest, Queue, Request, RequestCallback, RequestEnvGet, RequestEnvGetAll, RequestEnvSet, RequestEnvSubscribe, RequestEnvUnsubscribe, RequestEnvUpdate, RequestPluginCall, RequestPluginErrors, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, RequestTopicAnnounce, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe, Response, Subscriber
 from parallelazy.plugin_transport import sanitize_for_ipc
 
 
@@ -283,31 +283,47 @@ class PluginCoreRPC:
 
 class PluginLifeCycleRPC(PluginCoreRPC):
     """Convience class with manager-specific commands pre-registered.
+    PLUGIN_LOAD = "plugin_load"
     PLUGIN_START = "plugin_start"
     PLUGIN_STOP = "plugin_stop"
+    PLUGIN_UNLOAD = "plugin_unload"
     PLUGIN_STATUS = "plugin_status"
     PLUGIN_STATUS_ALL = "plugin_status_all"
     PLUGIN_ERRORS = "plugin_errors"
     PLUGIN_CALL = "plugin_call"
     """
-    def plugin_start(self):
+    def plugin_load(self, descriptor: Any, options: Dict[str, Any] = None):
+        """Ask the manager to load an instance described by descriptor."""
+        try:
+            return self.request(RequestPluginLoad(descriptor=descriptor, options=options))
+        except Exception as e:
+            logger.error(f"Failed to load plugin '{descriptor}': {e}")
+
+    def plugin_start(self, plugin_id: str = None):
         """
-        Start the plugin process.
+        Start a plugin. A manager omits plugin_id when starting its worker.
         """
         try:
-            return self.request(RequestPluginStart())
+            return self.request(RequestPluginStart(plugin_id=plugin_id))
         except Exception as e:
             logger.error(f"Failed to start plugin: {e}")
     
 
-    def plugin_stop(self) :
+    def plugin_stop(self, plugin_id: str = None):
         """
-        Stop the plugin process.
+        Stop a plugin. A manager omits plugin_id when stopping its worker.
         """
         try:
-            return self.request(RequestPluginStop())
+            return self.request(RequestPluginStop(plugin_id=plugin_id))
         except Exception as e:
             logger.error(f"Failed to stop plugin: {e}")
+
+    def plugin_unload(self, plugin_id: str):
+        """Ask the manager to unload a plugin."""
+        try:
+            return self.request(RequestPluginUnload(plugin_id=plugin_id))
+        except Exception as e:
+            logger.error(f"Failed to unload plugin '{plugin_id}': {e}")
         
     def plugin_call(self, plugin_id: str, method_name: str, *args, **kwargs):
         """

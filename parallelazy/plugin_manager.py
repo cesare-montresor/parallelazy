@@ -17,7 +17,7 @@ from parallelazy.utils import is_debugpy_attached, process_start_spawn
 from parallelazy.plugin import PluginDescriptor
 from parallelazy.plugin_rpc import PluginRPC, RequestEnvGetAll, RequestEnvUnsubscribe, RequestTopicAnnounce
 from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicSubscribe, RequestTopicUnsubscribe, setup_worker_debugging_env
-from parallelazy.plugin_data import  CommandType, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, Subscriber
+from parallelazy.plugin_data import  CommandType, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginLoad, RequestPluginStart, RequestPluginStop, RequestPluginUnload, Subscriber
 from parallelazy.environment_manager import EnvironmentManager
 
 
@@ -65,6 +65,7 @@ class PluginManager:
         """
         self._plugins: Dict[str, PluginInfo] = {}  # plugin_id -> PluginInfo
         self._plugins_lock = threading.Lock()  # For thread-safe plugin management
+        self._loading_plugins = set()
 
         self._topic_publishers: Dict[str, str] = {}       # topic -> plugin_id
         self._topic_subscribers: Dict[str, Dict[str, Subscriber]] = {}        # topic -> [queue, queue, ...]
@@ -129,7 +130,17 @@ class PluginManager:
         """
         plugin_id = descriptor.name
         options = options or descriptor.options or {}
+
+        with self._plugins_lock:
+            if plugin_id in self._plugins or plugin_id in self._loading_plugins:
+                logger.error(f"Plugin {plugin_id} is already loaded or loading")
+                return False
+            self._loading_plugins.add(plugin_id)
         
+        plugin_rpc = None
+        process = None
+        plugin_info = None
+        loaded = False
         try:
             plugin_rpc = PluginRPC(plugin_id)
             self._init_plugin_rpc(plugin_rpc)
@@ -145,13 +156,15 @@ class PluginManager:
             )
             
             
-            self._plugins[plugin_id] = PluginInfo(
+            plugin_info = PluginInfo(
                 plugin_id=plugin_id,
                 process=process,
                 rpc=plugin_rpc,
                 descriptor=descriptor,
                 options=options
             )
+            with self._plugins_lock:
+                self._plugins[plugin_id] = plugin_info
             
             process.start()
             is_ready = False
@@ -167,11 +180,29 @@ class PluginManager:
                 return False
 
             logger.info(f"Plugin {plugin_id} loaded")
+            loaded = True
             return True
             
         except Exception as e:
             logger.error(f"Error loading plugin {descriptor}: {e}")
             return False
+        finally:
+            if not loaded:
+                if process is not None and process.pid is not None:
+                    if process.is_alive():
+                        process.terminate()
+                    process.join(timeout=self.timeout_start)
+                    if process.is_alive():
+                        process.kill()
+                        process.join(timeout=self.timeout_start)
+                if plugin_rpc is not None:
+                    plugin_rpc.shutdown()
+                with self._plugins_lock:
+                    if self._plugins.get(plugin_id) is plugin_info:
+                        del self._plugins[plugin_id]
+                self._cleanup_plugin_registrations(plugin_id)
+            with self._plugins_lock:
+                self._loading_plugins.discard(plugin_id)
     
     def start_plugin(self, plugin_id: str) -> bool:
         """
@@ -270,22 +301,7 @@ class PluginManager:
                 if process.is_alive():
                     process.kill()
                 
-                # Clean up environment subscriptions
-                for env, plugins in list(self._env_subscribers.items()):
-                    if plugin_id in plugins:
-                        plugins.remove(plugin_id)
-                    if len(plugins) == 0:
-                        del self._env_subscribers[env]
-
-                # Clean up topic subscriptions
-                for topic, plugins in list(self._topic_subscribers.items()):
-                    if plugin_id in plugins.keys():
-                        del plugins[plugin_id] 
-
-                # Clean up topic publishers
-                for topic, publisher in list(self._topic_publishers.items()):
-                    if publisher == plugin_id:
-                        del self._topic_publishers[topic]
+                self._cleanup_plugin_registrations(plugin_id)
                 
                 del self._plugins[plugin_id]
             
@@ -297,6 +313,22 @@ class PluginManager:
             dump = traceback.print_exc()
             logger.error(f"Error unloading plugin {plugin_id}: {e}\n{dump}", stack_info=True)
             return False
+
+    def _cleanup_plugin_registrations(self, plugin_id: str) -> None:
+        for env, plugins in list(self._env_subscribers.items()):
+            if plugin_id in plugins:
+                plugins.remove(plugin_id)
+            if not plugins:
+                del self._env_subscribers[env]
+
+        for topic, plugins in list(self._topic_subscribers.items()):
+            plugins.pop(plugin_id, None)
+            if not plugins:
+                del self._topic_subscribers[topic]
+
+        for topic, publisher in list(self._topic_publishers.items()):
+            if publisher == plugin_id:
+                del self._topic_publishers[topic]
         
     def start_all_plugins(self) -> None:
         """Start all loaded plugins."""
@@ -488,8 +520,10 @@ class PluginManager:
         """
 
         #TODO: Handy but later
-        #plugin_rpc.on_request(CommandType.PLUGIN_START, self._handle_plugin_start)
-        #plugin_rpc.on_request(CommandType.PLUGIN_STOP, self._handle_plugin_stop)
+        plugin_rpc.on_request(CommandType.PLUGIN_LOAD, self._respond_plugin_load)
+        plugin_rpc.on_request(CommandType.PLUGIN_START, self._respond_plugin_start)
+        plugin_rpc.on_request(CommandType.PLUGIN_STOP, self._respond_plugin_stop)
+        plugin_rpc.on_request(CommandType.PLUGIN_UNLOAD, self._respond_plugin_unload)
         plugin_rpc.on_request(CommandType.PLUGIN_CALL, self._respond_call)  # forward
         #plugin_rpc.on_request(CommandType.PLUGIN_STATUS, self.get_plugin_status) 
         #plugin_rpc.on_request(CommandType.PLUGIN_STATUS_ALL, self.get_all_plugin_status)
@@ -509,7 +543,41 @@ class PluginManager:
     # LIFECYCLE: 
     # ========================================================================
 
+    def _respond_plugin_load(self, rpc: PluginRPC, req: RequestPluginLoad) -> bool:
+        if not isinstance(req.descriptor, PluginDescriptor):
+            raise TypeError("descriptor must be a PluginDescriptor")
+        if not req.descriptor.name:
+            raise ValueError("descriptor.name is required")
 
+        options = dict(req.descriptor.options or {})
+        options.update(req.options or {})
+        return self.load_plugin(req.descriptor, options)
+
+    def _respond_plugin_start(self, rpc: PluginRPC, req: RequestPluginStart) -> bool:
+        if not req.plugin_id:
+            raise ValueError("plugin_id is required")
+        if req.plugin_id == rpc.plugin_id:
+            raise ValueError("A plugin cannot start itself through lifecycle RPC")
+        return self.start_plugin(req.plugin_id)
+
+    def _respond_plugin_stop(self, rpc: PluginRPC, req: RequestPluginStop) -> bool:
+        if not req.plugin_id:
+            raise ValueError("plugin_id is required")
+        if req.plugin_id == rpc.plugin_id:
+            raise ValueError("A plugin cannot stop itself through lifecycle RPC")
+        return self.stop_plugin(req.plugin_id)
+
+    def _respond_plugin_unload(self, rpc: PluginRPC, req: RequestPluginUnload) -> bool:
+        if not req.plugin_id:
+            raise ValueError("plugin_id is required")
+        if req.plugin_id == rpc.plugin_id:
+            raise ValueError("A plugin cannot unload itself through lifecycle RPC")
+        if req.plugin_id not in self._plugins:
+            return False
+        return self.unload_plugin(req.plugin_id)
+
+
+    # ========================================================================
 
     def _respond_call(self, rpc: PluginRPC, req: RequestPluginCall) -> Any:
         

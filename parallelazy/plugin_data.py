@@ -173,8 +173,10 @@ class Channel:
 
 class CommandType:
     """Standard commands for plugin control."""
+    PLUGIN_LOAD = "plugin_load"
     PLUGIN_START = "plugin_start"
     PLUGIN_STOP = "plugin_stop"
+    PLUGIN_UNLOAD = "plugin_unload"
     PLUGIN_STATUS = "plugin_status"
     PLUGIN_STATUS_ALL = "plugin_status_all"
     PLUGIN_ERRORS = "plugin_errors"
@@ -195,8 +197,10 @@ class CommandType:
     @classmethod
     def commands(cls):
         return iter([
+            cls.PLUGIN_LOAD,
             cls.PLUGIN_START,
             cls.PLUGIN_STOP,
+            cls.PLUGIN_UNLOAD,
             cls.PLUGIN_STATUS,
             cls.PLUGIN_STATUS_ALL,
             cls.PLUGIN_ERRORS,
@@ -350,8 +354,10 @@ class ProcessStatus:
 
 """
 Classes for each request command:
+    PLUGIN_LOAD = "plugin_load"
     PLUGIN_START = "plugin_start"
     PLUGIN_STOP = "plugin_stop"
+    PLUGIN_UNLOAD = "plugin_unload"
     PLUGIN_STATUS = "plugin_status"
     PLUGIN_STATUS_ALL = "plugin_status_all"
     PLUGIN_ERRORS = "plugin_errors"
@@ -376,6 +382,12 @@ Classes for each request command:
 ### Plugin Lifecycle Requests
 
 @dataclass
+class RequestPluginLoad(Request):
+    command: CommandType = field(default=CommandType.PLUGIN_LOAD, init=False)
+    descriptor: Any = None
+    options: Optional[dict] = None
+
+@dataclass
 class RequestPluginStart(Request):
     command: CommandType = field(default=CommandType.PLUGIN_START, init=False)
     plugin_id: Optional[str] = None
@@ -383,6 +395,11 @@ class RequestPluginStart(Request):
 @dataclass
 class RequestPluginStop(Request):
     command: CommandType = field(default=CommandType.PLUGIN_STOP, init=False)
+    plugin_id: Optional[str] = None
+
+@dataclass
+class RequestPluginUnload(Request):
+    command: CommandType = field(default=CommandType.PLUGIN_UNLOAD, init=False)
     plugin_id: Optional[str] = None
 
 @dataclass

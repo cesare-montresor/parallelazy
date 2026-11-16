@@ -28,9 +28,35 @@ transport machinery unless an application is building a custom integration.
 - `env_get(name=None, default=None)`
 - `env_subscribe(name, callback)`
 - `plugin_call(plugin_id, method_name, *args, **kwargs)`
+- `plugin_load(descriptor, options=None)` loads a new plugin instance.
+- `plugin_start(plugin_id)` starts another loaded plugin.
+- `plugin_stop(plugin_id)` stops another loaded plugin.
+- `plugin_unload(plugin_id)` stops and removes another plugin.
 
 Callbacks are normally bound methods and must accept the delivered payload
 (one argument for topic and environment callbacks).
+
+Lifecycle requests are handled by the manager and return `bool`. A plugin
+cannot target itself with these RPC methods; use `Plugin.stop()` to stop the
+calling plugin. `plugin_load` takes a `PluginDescriptor` directly; each
+instance must have a unique descriptor name. Loading initializes the worker
+but does not start it, so call `plugin_start(descriptor.name)` separately.
+The manager forwards the descriptor and options to the new worker process;
+with the spawn start method, the descriptor's package and class must be
+importable in that process. Stopping a worker ends that worker process; to run
+it again, unload it and load its descriptor again under the same name.
+
+For example, a plugin can create separately configured instances:
+
+```python
+for layer_name in layer_names:
+    descriptor = LayerPlugin.Descriptor(
+        name=f"layer-{layer_name}",
+        options={"layer": layer_name},
+    )
+    if self.plugin_load(descriptor):
+        self.plugin_start(descriptor.name)
+```
 
 ## `parallelazy.plugin.PluginDescriptor`
 

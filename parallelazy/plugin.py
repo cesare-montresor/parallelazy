@@ -222,4 +222,22 @@ class Plugin:
         """Call a method provided by the manager or another plugin."""
         return self._worker.plugin_call(plugin_id, method_name, *args, **kwargs)
 
-    
+    def plugin_load(
+        self,
+        descriptor: PluginDescriptor,
+        options: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Load a plugin instance from its descriptor."""
+        return self._worker.plugin_load(descriptor, options)
+
+    def plugin_start(self, plugin_id: str) -> bool:
+        """Start another loaded plugin."""
+        return self._worker.plugin_start(plugin_id)
+
+    def plugin_stop(self, plugin_id: str) -> bool:
+        """Stop another loaded plugin."""
+        return self._worker.plugin_stop(plugin_id)
+
+    def plugin_unload(self, plugin_id: str) -> bool:
+        """Unload another plugin."""
+        return self._worker.plugin_unload(plugin_id)
