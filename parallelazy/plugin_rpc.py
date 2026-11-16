@@ -74,6 +74,10 @@ class PluginCoreRPC:
         # Request/response routing: cmd_id → Queue(maxsize=1)
         self._pending: Dict[str, PendingRequest] = {}
         self._pending_lock = threading.Lock()
+
+        self._commands_condition = threading.Condition()
+        self._accepting_commands = True
+        self._active_commands: Dict[str, int] = {}
         
         # Reader thread routes Responses to reply slots
         self._reader = threading.Thread(target=self._channel_listener, daemon=False)
@@ -124,6 +128,29 @@ class PluginCoreRPC:
             self._shutdown.put(None)
         except Exception:
             pass
+
+    def stop_accepting_commands(self) -> None:
+        """Reject new incoming requests while keeping response routing active."""
+        with self._commands_condition:
+            self._accepting_commands = False
+
+    def wait_for_commands(self, exclude=()) -> None:
+        """Wait for accepted command handlers to finish, except excluded commands."""
+        excluded = {str(command) for command in exclude}
+        with self._commands_condition:
+            self._commands_condition.wait_for(
+                lambda: not any(
+                    command not in excluded and count
+                    for command, count in self._active_commands.items()
+                )
+            )
+
+    def drain_commands(self) -> None:
+        """Stop the reader and wait for accepted handlers to respond."""
+        self.signal_shutdown()
+        if self._reader.is_alive() and threading.current_thread() is not self._reader:
+            self._reader.join()
+        self._executor.shutdown(wait=True, cancel_futures=False)
         
     
     def forward(self, req: Request, wait=True) -> Any:
@@ -225,10 +252,28 @@ class PluginCoreRPC:
             if cmd not in self.command_handlers:
                 raise ValueError(f"Command not registered: {cmd} (available: {list(self.command_handlers.keys())})")
 
-            self._executor.submit(self._execute_command, req)
+            with self._commands_condition:
+                if not self._accepting_commands:
+                    raise RuntimeError("RPC endpoint is stopping")
+                self._active_commands[cmd] = self._active_commands.get(cmd, 0) + 1
+
+            try:
+                self._executor.submit(self._execute_command, req)
+            except Exception:
+                self._command_finished(cmd)
+                raise
         except Exception as e:
             logger.error(f"Request handler error: {req} {e}", exc_info=True)
             self.respond(req, error=e)
+
+    def _command_finished(self, command: str) -> None:
+        with self._commands_condition:
+            remaining = self._active_commands.get(command, 0) - 1
+            if remaining > 0:
+                self._active_commands[command] = remaining
+            else:
+                self._active_commands.pop(command, None)
+            self._commands_condition.notify_all()
     
     def _handle_response(self, resp: Response) -> bool:
         """Route incoming response to pending request."""
@@ -255,18 +300,21 @@ class PluginCoreRPC:
         if cmd not in self.command_handlers:
             raise ValueError(f"Command not registered: {cmd} (available: {list(self.command_handlers.keys())})")
         
-        handler = self.command_handlers[cmd]
-        result = None
-        error = None
         try:
-            result = handler(self, req)
-        except Exception as e:
-            import traceback
-            stacktrace = traceback.format_exc()
-            error = str(e)
-            logger.error(f"Error occurred while executing command '{cmd}': {e}\n{stacktrace}", exc_info=True)
+            handler = self.command_handlers[cmd]
+            result = None
+            error = None
+            try:
+                result = handler(self, req)
+            except Exception as e:
+                import traceback
+                stacktrace = traceback.format_exc()
+                error = str(e)
+                logger.error(f"Error occurred while executing command '{cmd}': {e}\n{stacktrace}", exc_info=True)
 
-        self.respond(req, result=result, error=error)
+            self.respond(req, result=result, error=error)
+        finally:
+            self._command_finished(cmd)
         
     
     def on_request(self, command_name: CommandType, func: RequestCallback) -> None:

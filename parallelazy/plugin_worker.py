@@ -15,7 +15,6 @@ import logging
 import importlib
 from queue import Full
 import threading
-import time
 
 
 from parallelazy.utils import init_debugger, is_debugging_enabled, process_start_spawn, setup_worker_debugging_env
@@ -106,13 +105,12 @@ class PluginWorker:
         logger.setLevel(loglevel)
         
         self.did_start = threading.Event()
-        self.did_start.clear()
-
         self.did_stop = threading.Event()
-        self.did_stop.clear()
-
-        self.can_shutdown = threading.Event()
-        self.can_shutdown.clear()
+        self._stop_requested = threading.Event()
+        self._lifecycle = threading.Condition()
+        self._start_in_progress = False
+        self._start_complete = False
+        self._active_callbacks = 0
         
         # Topic subscriptions: topic_name -> queue
         
@@ -147,99 +145,133 @@ class PluginWorker:
     # ========================================================================
 
     def main(self) -> None:
-        """Main event loop: wait for requests and topic messages."""
+        """Run plugin work on the process main thread, then await shutdown."""
         logger.info(f"Plugin {self.plugin_id} worker started")
         cmds = list(self.rpc.command_handlers.keys())
         logger.debug(f"Plugin {self.plugin_id} registered commands: {cmds}")
 
-        
-        self._initialized.set()  # Signal to manager that initialization is complete
+        self.main_thread = threading.current_thread()
         self._is_running = True
-        self.did_start.wait()
-
-        self.main_thread = threading.Thread(target=self._plugin_main, daemon=True)
-        self.main_thread.start()
-
-        self.did_stop.wait()
-        
-        
-        logger.info(f"Plugin {self.plugin_id} worker stopped")
-        
-        self.shutdown()
-    
-    def _plugin_main(self):
-        logger.debug(f"[{self.plugin_id}] Plugin main loop started")
-        min_interval = 0.001  # floor between iterations; tune per-plugin if needed
-
-        while self._is_running:
-            start = time.perf_counter()
-            try:
-                self.plugin.main()
-            except KeyboardInterrupt:
-                logger.info(f"Plugin {self.plugin_id} interrupted")
-                self._is_running = False
-            except Exception as e:
-                logger.error(f"Plugin {self.plugin_id} error: {e}", exc_info=True)
-                import traceback
-                traceback.print_exc()
-                self.error_log.append(str(e))
-
-            elapsed = time.perf_counter() - start
-            remaining = min_interval - elapsed
-            if remaining > 0:
-                time.sleep(remaining)
-            # else: plugin.main() already took longer than min_interval,
-        # so we don't add any extra pause — go straight to the next call.
-
-    
-    def start(self):
-        """Start the plugin."""
+        self._initialized.set()  # Signal to manager that initialization is complete
         try:
-            self.plugin.on_start()
-            self.plugin._is_running = True
-            self.plugin.state = PluginState.RUNNING
-            self.did_start.set()
-        except Exception as e:
-            logger.error(f"Failed to start plugin: {e}")
-            raise
+            with self._lifecycle:
+                self._lifecycle.wait_for(
+                    lambda: self._start_complete or self._stop_requested.is_set()
+                )
+                run_main = self._start_complete and not self._stop_requested.is_set()
 
-    def stop(self):
-        """Stop the plugin."""
-        logger.debug(f"[{self.plugin_id}] Stopping plugin...")
+            if run_main:
+                logger.debug(f"[{self.plugin_id}] Plugin main started")
+                try:
+                    self.plugin.main()
+                except KeyboardInterrupt:
+                    logger.info(f"Plugin {self.plugin_id} interrupted")
+                    self._request_stop()
+                except Exception as e:
+                    logger.error(f"Plugin {self.plugin_id} error in main: {e}", exc_info=True)
+                    self.error_log.append(str(e))
+
+            self._stop_requested.wait()
+            self._finish_stop()
+        finally:
+            logger.info(f"Plugin {self.plugin_id} worker stopped")
+            self.shutdown()
+
+    def wait_for_stop(self, timeout: Optional[float] = None) -> bool:
+        """Wait until a stop has been requested; useful inside a blocking main()."""
+        return self._stop_requested.wait(timeout)
+
+    def _request_stop(self) -> None:
+        with self._lifecycle:
+            first_request = not self._stop_requested.is_set()
+            self._stop_requested.set()
+            self._is_running = False
+            if self.plugin is not None:
+                self.plugin._is_running = False
+            self._lifecycle.notify_all()
+
+        if first_request:
+            self.rpc.stop_accepting_commands()
+            self.did_start.set()
+
+    def _finish_stop(self) -> None:
+        with self._lifecycle:
+            self._lifecycle.wait_for(lambda: not self._start_in_progress)
+
+        self.rpc.wait_for_commands(exclude=(CommandType.PLUGIN_STOP,))
+        self._wake_topic_listeners()
+        with self._lifecycle:
+            self._lifecycle.wait_for(lambda: self._active_callbacks == 0)
+
         try:
             self.plugin.on_stop()
         except Exception as e:
-            logger.error(f"Failed to stop plugin: {e}")
+            logger.error(f"Failed to stop plugin: {e}", exc_info=True)
 
-        self._is_running = False
-        self.state = PluginState.STOPPED
-        self.rpc.signal_shutdown()
-        
+        with self._lifecycle:
+            self.plugin._is_running = False
+            self.plugin.state = PluginState.STOPPED
+            self.did_stop.set()
+            self._lifecycle.notify_all()
 
+        # Let stop handlers send their responses before closing the channel.
+        self.rpc.drain_commands()
+
+    def _wake_topic_listeners(self) -> None:
         for topic, subscription in list(self.topic_subscriptions.items()):
             try:
-                subscription.queue.put(None)  # Unblock any waiting get() calls
+                subscription.queue.put(None)
             except Exception as e:
                 logger.error(f"Error closing queue for topic '{topic}': {e}")
 
-        self.did_stop.set()
-        logger.debug(f"[{self.plugin_id}] Plugin stopped successfully.")
-        
+    def start(self) -> bool:
+        """Start the plugin once; the worker's main thread invokes plugin.main()."""
+        with self._lifecycle:
+            if self._stop_requested.is_set():
+                return False
+            if self._start_complete:
+                return True
+            if self._start_in_progress:
+                raise RuntimeError(f"Plugin {self.plugin_id} is already starting")
+            self._start_in_progress = True
+
+        try:
+            self.plugin.on_start()
+        except Exception as e:
+            logger.error(f"Failed to start plugin: {e}", exc_info=True)
+            with self._lifecycle:
+                self._start_in_progress = False
+                self._lifecycle.notify_all()
+            raise
+
+        with self._lifecycle:
+            self._start_in_progress = False
+            if not self._stop_requested.is_set():
+                self._start_complete = True
+                self.plugin._is_running = True
+                self.plugin.state = PluginState.RUNNING
+            self.did_start.set()
+            self._lifecycle.notify_all()
+            return self._start_complete
+
+    def stop(self, wait: bool = False) -> bool:
+        """Request plugin shutdown, optionally waiting for on_stop() to finish."""
+        self._request_stop()
+        if wait and threading.current_thread() is not self.main_thread:
+            self.did_stop.wait()
+        return True
+
     def shutdown(self) -> None:
-        """Clean up resources on shutdown."""
+        """Clean up resources after lifecycle hooks and accepted RPCs complete."""
         logger.info(f"Plugin {self.plugin_id} shutting down")
         self._is_running = False
-        self.state = PluginState.STOPPED
+        if self.plugin is not None:
+            self.plugin._is_running = False
+            self.plugin.state = PluginState.STOPPED
         try:
-            self.rpc.shutdown() 
+            self.rpc.shutdown()
         except Exception as e:
-            logger.error(f"Error closing RPC: {e}")
-
-        
-    
-
-
-
+            logger.error(f"Error closing RPC: {e}", exc_info=True)
     ## ========================================================================
     # Initialization
     # ========================================================================
@@ -610,22 +642,11 @@ class PluginWorker:
     
     def _respond_start(self, rpc: PluginRPC, req: RequestPluginStart) -> bool:
         """Start plugin."""
-        
-        try:
-            self.start()
-            return True
-        except Exception as e:
-            logger.error(f"Failed to start plugin: {e}")
-            raise
+        return self.start()
     
     def _respond_stop(self, rpc: PluginRPC, req: RequestPluginStop) -> bool:
         """Stop plugin."""
-        try:
-            self.stop()
-            return True
-        except Exception as e:
-            logger.error(f"Failed to stop plugin: {e}")
-            raise
+        return self.stop(wait=True)
     
     
     def _respond_status(self, rpc: PluginRPC, req: RequestPluginStatus) -> Dict[str, Any]:
@@ -653,6 +674,8 @@ class PluginWorker:
 
     def _respond_call(self, rpc: PluginRPC, req: RequestPluginCall) -> Any:
         """Invoke service method on plugin via reflection."""
+        if self._stop_requested.is_set():
+            raise RuntimeError(f"Plugin {self.plugin_id} is stopping")
         method_name = req.method_name
         args = req.args
         kwargs = req.kwargs
@@ -671,8 +694,20 @@ class PluginWorker:
         """Receive environment variable change notification."""
         var_name = req.name
         callback = self.env_subscriptions[var_name]
-        callback(var_name)
+        self._invoke_callback(callback, var_name)
         return True
+
+    def _invoke_callback(self, callback: Callable, *args) -> None:
+        with self._lifecycle:
+            if self._stop_requested.is_set():
+                return
+            self._active_callbacks += 1
+        try:
+            callback(*args)
+        finally:
+            with self._lifecycle:
+                self._active_callbacks -= 1
+                self._lifecycle.notify_all()
 
 
     # ========================================================================
@@ -721,7 +756,7 @@ class PluginWorker:
 
             # Call the plugin's callback with the new data
             try:
-                registered.callback(data)
+                self._invoke_callback(registered.callback, data)
             except Exception as e:
                 logger.error(f"Error in topic '{topic}' callback: {e}", exc_info=True)
                 self.error_log.append(str(e))

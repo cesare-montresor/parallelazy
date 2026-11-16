@@ -47,6 +47,8 @@ class Sensor(Plugin):
         self.sensor_type = options.get("sensor_type", "temperature")
 
     def on_start(self) -> None:
+        if self.sample_rate <= 0:
+            raise ValueError("sample_rate must be greater than zero")
         logger.info(f"[{self.plugin_id}] Sensor started with options:")
         logger.info(f"  - type: {self.sensor_type}")
         logger.info(f"  - sample_rate: {self.sample_rate} Hz")
@@ -59,21 +61,23 @@ class Sensor(Plugin):
         self.env_set("sensor.samples", 0)
 
     def main(self):
-        self.sample_count += 1
-        # Generate simulated sensor reading
-        base_value = 20 + (self.sample_count % 10)  # Temperature 20-30°C
-        import random
-        noise = random.gauss(0, self.noise_level)
-        reading = base_value + noise
+        interval = 1 / self.sample_rate
+        while not self.wait_for_stop(timeout=interval):
+            self.sample_count += 1
+            # Generate simulated sensor reading
+            base_value = 20 + (self.sample_count % 10)  # Temperature 20-30°C
+            import random
+            noise = random.gauss(0, self.noise_level)
+            reading = base_value + noise
 
-        if self.sample_count % 5 == 0:
-            logger.info(f"[{self.plugin_id}] Sample #{self.sample_count}: {reading:.2f}")
-            self.topic_publish("sensor.readings", {
-                "sample": self.sample_count,
-                "value": reading,
-                "type": self.sensor_type
-            })
-            self.env_set("sensor.samples", self.sample_count, wait=False)
+            if self.sample_count % 5 == 0:
+                logger.info(f"[{self.plugin_id}] Sample #{self.sample_count}: {reading:.2f}")
+                self.topic_publish("sensor.readings", {
+                    "sample": self.sample_count,
+                    "value": reading,
+                    "type": self.sensor_type
+                })
+                self.env_set("sensor.samples", self.sample_count, wait=False)
 
     def on_stop(self) -> None:
         logger.info(f"[{self.plugin_id}] Sensor stopped, collected {self.sample_count} samples")

@@ -47,8 +47,9 @@ class ExamplePluginPub(Plugin):
         self.env_set("count_pub", self.count)
 
     def main(self):
-        self.count +=1
-        self.topic_publish("count", self.count)
+        while not self.wait_for_stop(timeout=0.1):
+            self.count += 1
+            self.topic_publish("count", self.count)
 
     def on_stop(self) -> None:
         logger.info(f"[{self.plugin_id}] Total loop: {self.count}")

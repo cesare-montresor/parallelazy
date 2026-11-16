@@ -14,11 +14,15 @@ transport machinery unless an application is building a custom integration.
 
 ### Lifecycle methods
 
-- `on_start()`
-- `main()`
-- `on_stop()`
+- `on_start()` initializes resources and subscriptions.
+- `main()` runs once on the worker process's main thread. Returning from it
+  does not stop an event-driven plugin; the worker continues handling events.
+- `on_stop()` runs after `main()` exits and accepted RPC handlers and callbacks
+  finish.
 - `on_error(error, source=None)`
-- `stop()`
+- `stop()` requests shutdown; a blocking `main()` should observe it with
+  `wait_for_stop()`.
+- `wait_for_stop(timeout=None)` waits for a cooperative stop request.
 
 ### Communication methods
 

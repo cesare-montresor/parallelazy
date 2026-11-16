@@ -9,9 +9,10 @@ plugin, and communicates with the manager over pipe-backed channels.
 The lifecycle is deliberately separate:
 
 1. **Load**: create and initialize the worker process.
-2. **Start**: call `on_start()`, mark the plugin running, and begin repeated
-   calls to `main()`.
-3. **Stop**: call `on_stop()`, stop the loop, and close worker communication.
+2. **Start**: call `on_start()`, mark the plugin running, and call `main()`
+   once on the worker process's main thread.
+3. **Stop**: request cooperative shutdown, call `on_stop()` on the worker's
+   main thread, and close worker communication.
 4. **Unload**: remove the process and manager bookkeeping.
 
 `load_plugin()` and `start_plugin()` return `True` on success and `False` on a
@@ -23,13 +24,21 @@ ready.
 Subclass `Plugin` and use these hooks:
 
 - `on_start()`: initialize resources and register subscriptions;
-- `main()`: repeated work loop; it may be empty for event-driven plugins;
+- `main()`: optional synchronous work, called once on the worker's main thread;
 - `on_stop()`: release resources and publish final state;
 - `on_error(error, source=None)`: optional application error hook.
 
-The worker calls `main()` continuously while the plugin is running. Event
-callbacks for topics and environment changes are dispatched by the worker, so
-an event-driven plugin can use `pass` in `main()`.
+An event-driven plugin can return from `main()` immediately; the worker stays
+alive to process topic and environment callbacks until stopped. A plugin that
+does ongoing work in `main()` should periodically check
+`self.wait_for_stop(timeout)` or otherwise return when shutdown is requested.
+The worker calls `on_stop()` after `main()` exits and accepted RPC handlers and
+callbacks have finished.
+
+RPC methods and topic/environment callbacks run on worker threads and may run
+concurrently with `main()` and each other. Accepted handlers and callbacks are
+drained before `on_stop()` runs. Synchronize shared plugin state when it is
+accessed from more than one context.
 
 ## Descriptors and options
 

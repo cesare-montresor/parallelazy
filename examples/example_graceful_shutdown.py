@@ -48,10 +48,10 @@ class SimpleWorker(Plugin):
         self.iteration = 0
 
     def main(self):
-        """Main loop - runs repeatedly until on_stop() is called."""
-        self.iteration += 1
-        logger.debug(f"[{self.plugin_id}] Iteration {self.iteration}")
-        time.sleep(0.1)  # Brief sleep to simulate work
+        """Run on the worker's main thread until shutdown is requested."""
+        while not self.wait_for_stop(timeout=0.1):
+            self.iteration += 1
+            logger.debug(f"[{self.plugin_id}] Iteration {self.iteration}")
 
     def on_stop(self) -> None:
         """Graceful shutdown callback - called before plugin terminates."""

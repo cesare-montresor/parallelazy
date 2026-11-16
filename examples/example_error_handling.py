@@ -102,9 +102,10 @@ class ResilientClient(Plugin):
         self.env_set("client.requests_failed", 0)
 
     def main(self):
-        self.requests_sent += 1
-        if self.requests_sent % 3 == 0:
-            self._call_with_retry(self.requests_sent)
+        while not self.wait_for_stop(timeout=0.1):
+            self.requests_sent += 1
+            if self.requests_sent % 3 == 0:
+                self._call_with_retry(self.requests_sent)
 
     def _call_with_retry(self, request_id: int, max_retries: int = 3):
         """Call service with retry logic."""
@@ -178,18 +179,19 @@ class HealthMonitor(Plugin):
         logger.info(f"[{self.plugin_id}] Service status changed: {value}")
 
     def main(self):
-        self.checks += 1
-        if self.checks % 4 == 0:
-            # Check service metrics
-            success = self.env_get("service.success_count", 0)
-            failures = self.env_get("service.failure_count", 0)
-            total = success + failures
-            if total > 0:
-                failure_rate = failures / total
-                status = "UNHEALTHY" if failure_rate > 0.5 else "HEALTHY"
-                logger.info(
-                    f"[{self.plugin_id}] Health check: {status} (success_rate={1-failure_rate:.1%})"
-                )
+        while not self.wait_for_stop(timeout=0.1):
+            self.checks += 1
+            if self.checks % 4 == 0:
+                # Check service metrics
+                success = self.env_get("service.success_count", 0)
+                failures = self.env_get("service.failure_count", 0)
+                total = success + failures
+                if total > 0:
+                    failure_rate = failures / total
+                    status = "UNHEALTHY" if failure_rate > 0.5 else "HEALTHY"
+                    logger.info(
+                        f"[{self.plugin_id}] Health check: {status} (success_rate={1-failure_rate:.1%})"
+                    )
 
     def on_stop(self) -> None:
         logger.info(f"[{self.plugin_id}] HealthMonitor stopped after {self.checks} checks")

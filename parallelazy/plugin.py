@@ -98,7 +98,7 @@ class Plugin:
     Subclasses must implement:
     - on_start: Initialize plugin resources (optional)
     - on_stop: Clean up resources (optional)
-    - main: Main execution loop (optional)
+    - main: Main-thread work hook, called once after on_start (optional)
     - on_error: Handle errors (optional)
 
 
@@ -162,7 +162,13 @@ class Plugin:
         self._is_running = False
     
     
-    def main(self): pass
+    def main(self) -> None:
+        """Run once on the worker's main thread after startup."""
+        pass
+
+    def wait_for_stop(self, timeout: Optional[float] = None) -> bool:
+        """Wait for a stop request, typically from a blocking main() method."""
+        return self._worker.wait_for_stop(timeout)
     
     def on_start(self) -> None:
         """
@@ -191,8 +197,7 @@ class Plugin:
         return self._is_running
     
     def stop(self) -> None:
-        """Stop the plugin."""
-        
+        """Request plugin shutdown; use wait_for_stop() in blocking main() work."""
         self._worker.stop()
 
     def topic_subscribe(self, topic:str, callback:str) -> None:

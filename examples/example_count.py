@@ -45,8 +45,9 @@ class ExamplePluginCount(Plugin):
         self.count = None
 
     def main(self):
-        self.count +=1
-        self.env_set("count", self.count, wait=False)
+        while not self.wait_for_stop(timeout=0.1):
+            self.count += 1
+            self.env_set("count", self.count, wait=False)
 
 
     def on_start(self) -> None:
