@@ -72,8 +72,11 @@ def init_debugger(process_name: str = 'worker', wait_for_client: bool = True) ->
         
         _, assigned_port = debugpy.listen(("localhost", 0))
         
-        logger.info(f"Debugger listening on port {assigned_port}")
-        print(f"Debugger listening on port {assigned_port} for {process_name} process", flush=True) 
+        logger.info(
+            "Debugger listening on port %s for %s process",
+            assigned_port,
+            process_name,
+        )
         
         _notify_vscode_to_attach(assigned_port, process_name)
 

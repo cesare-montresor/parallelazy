@@ -20,6 +20,12 @@ import threading
 from parallelazy.utils import init_debugger, is_debugging_enabled, process_start_spawn, setup_worker_debugging_env
 from parallelazy.plugin_data import  Channel, CommandType, ProcessStatus, Queue,QueueDescriptor, PendingRequest, PluginStatus,  RequestPluginErrors, RequestPluginStart, RequestPluginStatus, RequestPluginStop, RequestTopicList, Subscriber, Subscription
 from parallelazy.plugin import Plugin, PluginDescriptor, PluginState
+from parallelazy.plugin_logging import (
+    LoggingSession,
+    PluginRuntimeSettings,
+    configure_worker_logging,
+    default_runtime_settings,
+)
 
 from parallelazy.plugin_rpc import  PluginRPC, RequestEnvUpdate, RequestPluginCall, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe, sanitize_for_ipc
 from multiprocessing.synchronize import Event
@@ -59,7 +65,8 @@ class PluginWorker:
         descriptor_dict: Dict[str, Any],
         options: Dict[str, Any],
         queue_descriptor: QueueDescriptor,
-        initialized: Event
+        initialized: Event,
+        runtime_settings: Optional[PluginRuntimeSettings] = None,
     ) -> None:
         """
         Entry point for plugin subprocess.
@@ -70,20 +77,26 @@ class PluginWorker:
             options: Plugin options
             queue_descriptor: Queue descriptor for communication
             initialized: Event to signal initialization completion
+            runtime_settings: Resolved paths and logging settings for this worker
         """
-        if is_debugging_enabled():
-            logger.setLevel(logging.DEBUG)
-            init_debugger(plugin_id)
+        runtime_settings = runtime_settings or default_runtime_settings()
+        logging_session = configure_worker_logging(runtime_settings, plugin_id)
+        try:
+            if is_debugging_enabled():
+                init_debugger(plugin_id)
 
-            
-        worker = PluginWorker(
-            plugin_id,
-            descriptor_dict,
-            options,
-            queue_descriptor,
-            initialized
-        )
-        worker.main()
+            worker = PluginWorker(
+                plugin_id,
+                descriptor_dict,
+                options,
+                queue_descriptor,
+                initialized,
+                runtime_settings=runtime_settings,
+                logging_session=logging_session,
+            )
+            worker.main()
+        finally:
+            logging_session.close()
     
     def __init__(
         self,
@@ -92,17 +105,25 @@ class PluginWorker:
         options: Dict[str, Any],
         queue_descriptor: QueueDescriptor,
         initialized: Event,
-        loglevel: int = logging.INFO
+        runtime_settings: Optional[PluginRuntimeSettings] = None,
+        logging_session: Optional[LoggingSession] = None,
     ):
         """Initialize worker."""
+
+        runtime_settings = runtime_settings or default_runtime_settings()
+        owns_logging = logging_session is None
+        if logging_session is None:
+            logging_session = configure_worker_logging(runtime_settings, plugin_id)
 
         self.plugin_id = plugin_id
         self.descriptor = PluginDescriptor.from_dict(descriptor_dict)
         self.options = options
+        self.work_dir = runtime_settings.work_dir
+        self.log_dir = runtime_settings.log_dir
         self._is_running = False
         self._initialized: Event = initialized
-        self.loglevel = loglevel
-        logger.setLevel(loglevel)
+        self._logging = logging_session
+        self._owns_logging = owns_logging
         
         self.did_start = threading.Event()
         self.did_stop = threading.Event()
@@ -132,12 +153,24 @@ class PluginWorker:
         channel = Channel(queue_descriptor)
         self.rpc = PluginRPC(self.plugin_id, channel, start_listener=False)
 
-        self._init_rpc()
-        
-        self._init_plugin()
+        try:
+            self._init_rpc()
+            self._init_plugin()
+        except Exception:
+            if self._owns_logging:
+                self._logging.close()
+            raise
         
         
         self.rpc.start_listener()  # Start the RPC listener after initialization
+
+    def set_log_formats(
+        self,
+        file_format: Optional[str] = None,
+        console_format: Optional[str] = None,
+    ) -> None:
+        """Change this worker's file and/or console log format."""
+        self._logging.set_formats(file_format, console_format)
 
 
     ## ========================================================================
@@ -146,9 +179,9 @@ class PluginWorker:
 
     def main(self) -> None:
         """Run plugin work on the process main thread, then await shutdown."""
-        logger.info(f"Plugin {self.plugin_id} worker started")
+        logger.info("Worker started")
         cmds = list(self.rpc.command_handlers.keys())
-        logger.debug(f"Plugin {self.plugin_id} registered commands: {cmds}")
+        logger.debug("Registered commands: %s", cmds)
 
         self.main_thread = threading.current_thread()
         self._is_running = True
@@ -161,20 +194,20 @@ class PluginWorker:
                 run_main = self._start_complete and not self._stop_requested.is_set()
 
             if run_main:
-                logger.debug(f"[{self.plugin_id}] Plugin main started")
+                logger.debug("Plugin main started")
                 try:
                     self.plugin.main()
                 except KeyboardInterrupt:
-                    logger.info(f"Plugin {self.plugin_id} interrupted")
+                    logger.info("Plugin interrupted")
                     self._request_stop()
                 except Exception as e:
-                    logger.error(f"Plugin {self.plugin_id} error in main: {e}", exc_info=True)
+                    logger.error("Plugin error in main: %s", e, exc_info=True)
                     self.error_log.append(str(e))
 
             self._stop_requested.wait()
             self._finish_stop()
         finally:
-            logger.info(f"Plugin {self.plugin_id} worker stopped")
+            logger.info("Worker stopped")
             self.shutdown()
 
     def wait_for_stop(self, timeout: Optional[float] = None) -> bool:
@@ -263,7 +296,7 @@ class PluginWorker:
 
     def shutdown(self) -> None:
         """Clean up resources after lifecycle hooks and accepted RPCs complete."""
-        logger.info(f"Plugin {self.plugin_id} shutting down")
+        logger.info("Worker shutting down")
         self._is_running = False
         if self.plugin is not None:
             self.plugin._is_running = False
@@ -272,6 +305,9 @@ class PluginWorker:
             self.rpc.shutdown()
         except Exception as e:
             logger.error(f"Error closing RPC: {e}", exc_info=True)
+        finally:
+            if getattr(self, "_owns_logging", False):
+                self._logging.close()
     ## ========================================================================
     # Initialization
     # ========================================================================
@@ -287,9 +323,9 @@ class PluginWorker:
 
             # Instantiate plugin with proxy
             self.plugin = plugin_class(self, self.plugin_id, self.options )
-            logger.info(f"Plugin {self.plugin_id} instantiated")
+            logger.info("Plugin instantiated")
         except Exception as e:
-            logger.error(f"Failed to init plugin {self.plugin_id}: {e}")
+            logger.error("Failed to initialize plugin: %s", e)
             raise
 
     def _init_rpc(self) -> None:
@@ -555,7 +591,7 @@ class PluginWorker:
     def topic_unsubscribe(self, topic: str) -> bool:
         """Get all environment variables."""
         if not topic in self.topic_subscriptions:
-            logger.warning(f"Plugin {self.plugin_id} not subscribed to topic '{topic}'")
+            logger.warning("Not subscribed to topic '%s'", topic)
             return True
         
         subscription = self.topic_subscriptions[topic] 
@@ -742,7 +778,7 @@ class PluginWorker:
         while True:
             
             if self._is_running is False:
-                logger.info(f"Plugin {self.plugin_id} worker stopping, exiting topic listener for '{topic}'")
+                logger.info("Worker stopping, exiting topic listener for '%s'", topic)
                 break
 
             # check is subscription still active (in case unsubscribed while waiting for data)
@@ -756,7 +792,7 @@ class PluginWorker:
             try:
                 data = registered.queue.get() # Blocking wait for new data
                 if data is None:
-                    logger.info(f"Plugin {self.plugin_id} received shutdown sentinel for topic '{topic}'")
+                    logger.info("Received shutdown sentinel for topic '%s'", topic)
                     break
             except ValueError as e:
                 if registered.queue.closed():
@@ -768,8 +804,9 @@ class PluginWorker:
                     continue
             except (EOFError, OSError) as e:
                 logger.info(
-                    f"Subscription for plugin '{self.plugin_id}' topic '{topic}' "
-                    f"closed, stopping listener thread: {e}"
+                    "Subscription for topic '%s' closed, stopping listener thread: %s",
+                    topic,
+                    e,
                 )
                 break
             except Exception as e:
@@ -782,7 +819,9 @@ class PluginWorker:
                 self._invoke_callback(registered.callback, data)
             except Exception as e:
                 logger.error(
-                    f"Error in plugin '{self.plugin_id}' topic '{topic}' callback: {e}",
+                    "Error in topic '%s' callback: %s",
+                    topic,
+                    e,
                     exc_info=True,
                 )
                 self.error_log.append(str(e))

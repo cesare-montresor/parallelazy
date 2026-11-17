@@ -5,6 +5,7 @@ Defines the lifecycle, subscription, and service interfaces that all
 plugins must implement or can override.
 """
 
+import logging
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING, Self
 from enum import Enum
 
@@ -59,6 +60,10 @@ class PluginDescriptor:
     author: str = ""
     options: Dict[str, Any] = field(default_factory=dict)
     dependencies: list = field(default_factory=list)
+    work_dir: Optional[str] = None
+    log_dir: Optional[str] = None
+    log_level: Optional[int] = None
+    display_logs: Optional[bool] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert descriptor to dictionary (JSON-serializable)."""
@@ -127,7 +132,18 @@ class Plugin:
         return {}
 
     @classmethod
-    def Descriptor(cls, version:str, author:str, description:str=None, name:str=None, options: Dict[str, Any] = None) -> PluginDescriptor:
+    def Descriptor(
+        cls,
+        version: str,
+        author: str,
+        description: str = None,
+        name: str = None,
+        options: Dict[str, Any] = None,
+        work_dir: Optional[str] = None,
+        log_dir: Optional[str] = None,
+        log_level: Optional[int] = None,
+        display_logs: Optional[bool] = None,
+    ) -> PluginDescriptor:
         all_options = cls.default_options().copy()
         all_options.update(options or {})
 
@@ -140,6 +156,10 @@ class Plugin:
             package=f"{cls.__module__}",
             class_name=cls.__name__,
             description=description or f"{cls.__doc__}",
+            work_dir=work_dir,
+            log_dir=log_dir,
+            log_level=log_level,
+            display_logs=display_logs,
             
         )
 
@@ -160,6 +180,21 @@ class Plugin:
         self.state = PluginState.INITIALIZED
         self.options = all_options
         self._is_running = False
+        self._work_dir = worker.work_dir
+        self.logger = logging.getLogger(self.__class__.__module__)
+
+    @property
+    def work_dir(self) -> str:
+        """Absolute working directory resolved for this plugin instance."""
+        return self._work_dir
+
+    def set_log_formats(
+        self,
+        file_format: Optional[str] = None,
+        console_format: Optional[str] = None,
+    ) -> None:
+        """Change this worker's file and/or console log format."""
+        self._worker.set_log_formats(file_format, console_format)
     
     
     def main(self) -> None:

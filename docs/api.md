@@ -8,9 +8,13 @@ transport machinery unless an application is building a custom integration.
 
 ### Class methods
 
-- `Descriptor(version, author, description=None, name=None, options=None)`
+- `Descriptor(version, author, description=None, name=None, options=None, work_dir=None, log_dir=None, log_level=None, display_logs=None)`
   returns a `PluginDescriptor`.
 - `default_options()` returns a dictionary of default plugin options.
+
+`work_dir` is available as a read-only `self.work_dir` path. `self.logger`
+provides a standard Python logger. `set_log_formats(file_format=None,
+console_format=None)` changes the formats for this plugin worker only.
 
 ### Lifecycle methods
 
@@ -76,6 +80,10 @@ Dataclass fields:
 | `author` | Plugin author |
 | `options` | Default configuration dictionary |
 | `dependencies` | Declared dependency names |
+| `work_dir` | Optional plugin working directory; relative paths resolve under the manager's work directory |
+| `log_dir` | Optional plugin log directory; relative paths resolve under the plugin's effective working directory |
+| `log_level` | Optional integer Python logging level; defaults to the manager's level |
+| `display_logs` | Optional console logging flag; defaults to the manager's setting |
 
 Serialization helpers are `to_dict()`, `to_json()`, `from_dict()`, and
 `from_json()`.
@@ -85,12 +93,26 @@ Serialization helpers are `to_dict()`, `to_json()`, `from_dict()`, and
 Constructor:
 
 ```python
+import logging
+
 PluginManager(
     timeout_request=5.0,
-    timeout_start=5.0,
-    worker_pydebug=False,
+    timeout_start=10.0,
+    timeout_start_debug=30.0,
+    work_dir=None,
+    log_dir="logs",
+    log_level=logging.INFO,
+    display_logs=True,
 )
 ```
+
+The manager resolves `work_dir` to the current directory when omitted and
+resolves a relative `log_dir` under it. A unique run folder is created below
+the log directory. It contains `manager.log` and one log file per plugin.
+Descriptor values override the corresponding manager defaults for that plugin.
+File and console output use the effective log level; console output is enabled
+by default. The manager and plugins can independently change their process's
+formats with `set_log_formats(file_format=None, console_format=None)`.
 
 ### Lifecycle
 

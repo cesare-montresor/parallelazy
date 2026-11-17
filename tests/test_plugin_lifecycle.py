@@ -87,7 +87,7 @@ def _make_worker(plugin):
 
 
 class PluginLifecycleTests(unittest.TestCase):
-    def test_topic_callback_error_log_identifies_plugin(self):
+    def test_topic_callback_error_log_identifies_topic_without_repeating_plugin_id(self):
         plugin = _RaisingCallbackPlugin()
         worker = _make_worker(plugin)
         worker._is_running = True
@@ -102,10 +102,10 @@ class PluginLifecycleTests(unittest.TestCase):
         with self.assertLogs("parallelazy.plugin_worker", level="ERROR") as logs:
             worker._topic_listener("scores")
 
-        self.assertIn("plugin 'test-plugin'", logs.output[0])
         self.assertIn("topic 'scores' callback", logs.output[0])
+        self.assertNotIn("test-plugin", logs.output[0])
 
-    def test_closed_topic_queue_log_identifies_plugin(self):
+    def test_closed_topic_queue_log_does_not_repeat_plugin_id(self):
         worker = _make_worker(None)
         worker._is_running = True
         worker.did_start.set()
@@ -118,8 +118,8 @@ class PluginLifecycleTests(unittest.TestCase):
         with self.assertLogs("parallelazy.plugin_worker", level="INFO") as logs:
             worker._topic_listener("scores")
 
-        self.assertIn("plugin 'test-plugin'", logs.output[0])
-        self.assertIn("topic 'scores' closed", logs.output[0])
+        self.assertIn("Subscription for topic 'scores' closed", logs.output[0])
+        self.assertNotIn("test-plugin", logs.output[0])
         self.assertIn("No such file or directory", logs.output[0])
 
     def _start_worker(self, worker):

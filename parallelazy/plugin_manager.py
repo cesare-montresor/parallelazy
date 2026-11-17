@@ -7,7 +7,7 @@ Uses simplified request/response protocol via Channel.
 
 from dataclasses import dataclass
 import logging
-import sys
+import os
 import threading
 import torch.multiprocessing as mp
 import time
@@ -15,17 +15,18 @@ from typing import Any, Dict, List, Optional
 
 from parallelazy.utils import is_debugpy_attached, process_start_spawn
 from parallelazy.plugin import PluginDescriptor
+from parallelazy.plugin_logging import (
+    PluginRuntimeSettings,
+    configure_manager_logging,
+    create_run_id,
+    resolve_directory,
+)
 from parallelazy.plugin_rpc import PluginRPC, RequestEnvGetAll, RequestEnvUnsubscribe, RequestTopicAnnounce
 from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicSubscribe, RequestTopicUnsubscribe, setup_worker_debugging_env
 from parallelazy.plugin_data import  CommandType, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, Subscriber
 from parallelazy.environment_manager import EnvironmentManager
 
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
-
-    
 process_start_spawn()
     
 
@@ -53,7 +54,11 @@ class PluginManager:
         self,
         timeout_request: float = 5.0,
         timeout_start: float = 10.0,
-        timeout_start_debug: float = 30.0
+        timeout_start_debug: float = 30.0,
+        work_dir: Optional[str] = None,
+        log_dir: str = "logs",
+        log_level: int = logging.INFO,
+        display_logs: bool = True,
     ):
         """
         Initialize plugin manager.
@@ -62,7 +67,33 @@ class PluginManager:
             timeout_request: Default timeout for sync requests (seconds)
             timeout_start: Timeout for start command (seconds)
             timeout_start_debug: Timeout for start command in debug mode (seconds)
+            work_dir: Base working directory for the manager and plugins
+            log_dir: Log directory, relative to work_dir unless absolute
+            log_level: Default logging level for the manager and plugins
+            display_logs: Whether to also emit logs to the terminal
         """
+        if not isinstance(display_logs, bool):
+            raise TypeError("display_logs must be a bool")
+        if isinstance(log_level, bool) or not isinstance(log_level, int):
+            raise TypeError("log_level must be an integer logging level")
+
+        self.work_dir = resolve_directory(work_dir or os.getcwd())
+        self.log_dir = resolve_directory(log_dir, self.work_dir)
+        self.log_level = log_level
+        self.display_logs = display_logs
+        self.run_id = create_run_id()
+        self.run_log_dir = os.path.join(self.log_dir, self.run_id)
+        os.makedirs(self.work_dir, exist_ok=True)
+        os.makedirs(self.run_log_dir, exist_ok=True)
+
+        self._logging = configure_manager_logging(
+            os.path.join(self.run_log_dir, "manager.log"),
+            log_level,
+            display_logs,
+            self.run_id,
+        )
+        self.logger = self._logging.logger
+
         self._plugins: Dict[str, PluginInfo] = {}  # plugin_id -> PluginInfo
         self._plugins_lock = threading.Lock()  # For thread-safe plugin management
         self._loading_plugins = set()
@@ -80,6 +111,52 @@ class PluginManager:
 
         if self.worker_pydebug:
             setup_worker_debugging_env()
+
+    def set_log_formats(
+        self,
+        file_format: Optional[str] = None,
+        console_format: Optional[str] = None,
+    ) -> None:
+        """Change this manager's file and/or console log format."""
+        self._logging.set_formats(file_format, console_format)
+
+    def _plugin_runtime_settings(
+        self,
+        descriptor: PluginDescriptor,
+    ) -> PluginRuntimeSettings:
+        if descriptor.display_logs is not None and not isinstance(descriptor.display_logs, bool):
+            raise TypeError("descriptor.display_logs must be a bool or None")
+        if descriptor.log_level is not None and (
+            isinstance(descriptor.log_level, bool)
+            or not isinstance(descriptor.log_level, int)
+        ):
+            raise TypeError("descriptor.log_level must be an integer logging level or None")
+
+        work_dir = (
+            self.work_dir
+            if descriptor.work_dir is None
+            else resolve_directory(descriptor.work_dir, self.work_dir)
+        )
+        log_dir = (
+            self.log_dir
+            if descriptor.log_dir is None
+            else resolve_directory(descriptor.log_dir, work_dir)
+        )
+        run_log_dir = os.path.join(log_dir, self.run_id)
+        os.makedirs(work_dir, exist_ok=True)
+        os.makedirs(run_log_dir, exist_ok=True)
+        return PluginRuntimeSettings(
+            work_dir=work_dir,
+            log_dir=run_log_dir,
+            log_level=(
+                self.log_level if descriptor.log_level is None else descriptor.log_level
+            ),
+            display_logs=(
+                self.display_logs
+                if descriptor.display_logs is None
+                else descriptor.display_logs
+            ),
+        )
 
 
     def load_plugins(self, descriptors: List[PluginDescriptor], parallel: bool = True) -> None:
@@ -133,7 +210,7 @@ class PluginManager:
 
         with self._plugins_lock:
             if plugin_id in self._plugins or plugin_id in self._loading_plugins:
-                logger.error(f"Plugin {plugin_id} is already loaded or loading")
+                self.logger.error(f"Plugin {plugin_id} is already loaded or loading")
                 return False
             self._loading_plugins.add(plugin_id)
         
@@ -142,6 +219,7 @@ class PluginManager:
         plugin_info = None
         loaded = False
         try:
+            runtime_settings = self._plugin_runtime_settings(descriptor)
             plugin_rpc = PluginRPC(plugin_id)
             self._init_plugin_rpc(plugin_rpc)
             worker_channel = plugin_rpc.channel.remote_descriptor()  # For worker to manager communication
@@ -151,7 +229,14 @@ class PluginManager:
             # Spawn worker process
             process = mp.Process(
                 target=PluginWorker.run,
-                args=(plugin_id, descriptor.to_dict(), options, worker_channel, initialized), 
+                args=(
+                    plugin_id,
+                    descriptor.to_dict(),
+                    options,
+                    worker_channel,
+                    initialized,
+                    runtime_settings,
+                ),
                 name=f"plugin-{plugin_id}"
             )
             
@@ -172,19 +257,19 @@ class PluginManager:
                 is_ready = initialized.wait(timeout=self.timeout_start)
                 if is_ready: break
                 # If we get here, wait() timed out but the process is still alive
-                logger.info(f"Plugin {plugin_id} is still initializing (waiting...)")
+                self.logger.info(f"Plugin {plugin_id} is still initializing (waiting...)")
 
             # If the loop exited and is_ready is False, the process died before setting the event
             if not is_ready:
-                logger.error(f"Plugin {plugin_id} failed to initialize (process terminated unexpectedly).")
+                self.logger.error(f"Plugin {plugin_id} failed to initialize (process terminated unexpectedly).")
                 return False
 
-            logger.info(f"Plugin {plugin_id} loaded")
+            self.logger.info(f"Plugin {plugin_id} loaded")
             loaded = True
             return True
             
         except Exception as e:
-            logger.error(f"Error loading plugin {descriptor}: {e}")
+            self.logger.error(f"Error loading plugin {descriptor}: {e}")
             return False
         finally:
             if not loaded:
@@ -215,7 +300,7 @@ class PluginManager:
             True if started successfully
         """
         if plugin_id not in self._plugins:
-            logger.error(f"Plugin {plugin_id} not loaded")
+            self.logger.error(f"Plugin {plugin_id} not loaded")
             return False
         
         try:
@@ -223,15 +308,15 @@ class PluginManager:
             pending = info.rpc.plugin_start()
             res = pending.wait(timeout=self.timeout_start)
             if not res:
-                logger.warning(f"Plugin {plugin_id} failed to start within {self.timeout_start} seconds")
+                self.logger.warning(f"Plugin {plugin_id} failed to start within {self.timeout_start} seconds")
                 return False
             if res.error:
-                logger.error(f"Plugin {plugin_id} start error: {res.error}")
+                self.logger.error(f"Plugin {plugin_id} start error: {res.error}")
                 return False
 
             return res.result
         except Exception as e:
-            logger.error(f"Error starting plugin {plugin_id}: {e}")
+            self.logger.error(f"Error starting plugin {plugin_id}: {e}")
             return False
         
     
@@ -256,18 +341,18 @@ class PluginManager:
             pending = info.rpc.plugin_stop()
             res = pending.wait(timeout=self.timeout_start)
             if not res:
-                logger.warning(f"Plugin {plugin_id} failed to stop within {self.timeout_start} seconds")
+                self.logger.warning(f"Plugin {plugin_id} failed to stop within {self.timeout_start} seconds")
                 return False
             if res.error:
-                logger.error(f"Plugin {plugin_id} stop error: {res.error}")
+                self.logger.error(f"Plugin {plugin_id} stop error: {res.error}")
                 return False
             
-            logger.info(f"Plugin {plugin_id} stop: {res.result}")
+            self.logger.info(f"Plugin {plugin_id} stop: {res.result}")
             if res.result:
                 info.stop_confirmed = True
             return res.result
         except Exception as e:
-            logger.error(f"Error stopping plugin {plugin_id}: {e}")
+            self.logger.error(f"Error stopping plugin {plugin_id}: {e}")
             return False
     
     def unload_plugin(self, plugin_id: str) -> bool:
@@ -305,13 +390,13 @@ class PluginManager:
                 
                 del self._plugins[plugin_id]
             
-            logger.info(f"Plugin {plugin_id} unloaded")
+            self.logger.info(f"Plugin {plugin_id} unloaded")
             return True
             
         except Exception as e:
             import traceback
             dump = traceback.print_exc()
-            logger.error(f"Error unloading plugin {plugin_id}: {e}\n{dump}", stack_info=True)
+            self.logger.error(f"Error unloading plugin {plugin_id}: {e}\n{dump}", stack_info=True)
             return False
 
     def _cleanup_plugin_registrations(self, plugin_id: str) -> None:
@@ -377,13 +462,13 @@ class PluginManager:
                 pending = info.rpc.plugin_status()
                 status_response = pending.wait(timeout=1.0)
                 if status_response is None:
-                    logger.debug(f"[{plugin_id}] No status received")
+                    self.logger.debug(f"[{plugin_id}] No status received")
                 elif status_response.error:
-                    logger.debug(f"[{plugin_id}] Error getting status: {status_response.error}")
+                    self.logger.debug(f"[{plugin_id}] Error getting status: {status_response.error}")
                 else:
                     worker_status = status_response.result
             except Exception as e:
-                logger.debug(f"[{plugin_id}] Failed to get status: {e}")
+                self.logger.debug(f"[{plugin_id}] Failed to get status: {e}")
         
         return ProcessStatus(
             plugin_id=plugin_id,
@@ -479,7 +564,7 @@ class PluginManager:
             try:
                 subscriber.queue.put_nowait(data)
             except Exception as e:
-                logger.debug(f"Failed to deliver to topic '{topic}': {e}")
+                self.logger.debug(f"Failed to deliver to topic '{topic}': {e}")
         
         return True
 
@@ -647,7 +732,7 @@ class PluginManager:
         if plugin_pub is not None:
             forward_rpc = self._plugins[plugin_pub].rpc
             remote_result = forward_rpc.forward(req)
-            logger.info("MANAGER: topic_subscribe: remote_result: %s", remote_result)
+            self.logger.info("MANAGER: topic_subscribe: remote_result: %s", remote_result)
 
         if not remote_result: return False
 
