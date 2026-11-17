@@ -17,7 +17,7 @@ from parallelazy.utils import is_debugpy_attached, process_start_spawn
 from parallelazy.plugin import PluginDescriptor
 from parallelazy.plugin_rpc import PluginRPC, RequestEnvGetAll, RequestEnvUnsubscribe, RequestTopicAnnounce
 from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicSubscribe, RequestTopicUnsubscribe, setup_worker_debugging_env
-from parallelazy.plugin_data import  CommandType, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginLoad, RequestPluginStart, RequestPluginStop, RequestPluginUnload, Subscriber
+from parallelazy.plugin_data import  CommandType, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, Subscriber
 from parallelazy.environment_manager import EnvironmentManager
 
 
@@ -525,8 +525,8 @@ class PluginManager:
         plugin_rpc.on_request(CommandType.PLUGIN_STOP, self._respond_plugin_stop)
         plugin_rpc.on_request(CommandType.PLUGIN_UNLOAD, self._respond_plugin_unload)
         plugin_rpc.on_request(CommandType.PLUGIN_CALL, self._respond_call)  # forward
-        #plugin_rpc.on_request(CommandType.PLUGIN_STATUS, self.get_plugin_status) 
-        #plugin_rpc.on_request(CommandType.PLUGIN_STATUS_ALL, self.get_all_plugin_status)
+        plugin_rpc.on_request(CommandType.PLUGIN_STATUS, self._respond_plugin_status)
+        plugin_rpc.on_request(CommandType.PLUGIN_STATUS_ALL, self._respond_plugin_status_all)
 
         plugin_rpc.on_request(CommandType.ENV_SET, self._respond_env_set)
         plugin_rpc.on_request(CommandType.ENV_GET, self._respond_env_get)
@@ -575,6 +575,14 @@ class PluginManager:
         if req.plugin_id not in self._plugins:
             return False
         return self.unload_plugin(req.plugin_id)
+
+    def _respond_plugin_status(self, rpc: PluginRPC, req: RequestPluginStatus) -> Optional[ProcessStatus]:
+        """Return the requested plugin status, defaulting to the requesting plugin."""
+        return self.plugin_status(req.plugin_id or req.sender)
+
+    def _respond_plugin_status_all(self, rpc: PluginRPC, req: RequestPluginStatusAll) -> Dict[str, ProcessStatus]:
+        """Return the status of every loaded plugin."""
+        return self.plugin_status_all()
 
 
     # ========================================================================

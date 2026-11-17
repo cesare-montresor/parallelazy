@@ -111,6 +111,10 @@ PluginManager(
 - `plugin_status(plugin_id)` returns a `ProcessStatus` or `None`.
 - `plugin_status_all()` returns a mapping of IDs to `ProcessStatus`.
 
+Plugin code can also call `self.plugin_status(plugin_id=None)` to inspect its
+own status (or another loaded plugin's status), and `self.plugin_status_all()`
+to inspect all loaded plugins.
+
 ### Environment and topics
 
 - `env_set(name, value)`

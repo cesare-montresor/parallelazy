@@ -5,7 +5,7 @@ Defines the lifecycle, subscription, and service interfaces that all
 plugins must implement or can override.
 """
 
-from typing import Any, Dict, Optional, TYPE_CHECKING, Self
+from typing import Any, Callable, Dict, Optional, TYPE_CHECKING, Self
 from enum import Enum
 
 from parallelazy.utils import camel_to_kebab
@@ -200,7 +200,7 @@ class Plugin:
         """Request plugin shutdown; use wait_for_stop() in blocking main() work."""
         self._worker.stop()
 
-    def topic_subscribe(self, topic:str, callback:str) -> None:
+    def topic_subscribe(self, topic:str, callback:Callable) -> None:
         """Subscribe to a data topic or environment variable."""
         self._worker.topic_subscribe(topic, callback)
 
@@ -217,9 +217,10 @@ class Plugin:
         if name is None:
             return self._worker.env_get_all() 
 
-        return self._worker.env_get(name) or default
+        value = self._worker.env_get(name)
+        return default if value is None else value
     
-    def env_subscribe(self, name:str, callback:str) -> None:
+    def env_subscribe(self, name:str, callback:Callable) -> None:
         """Subscribe to changes in an environment variable."""
         self._worker.env_subscribe(name, callback)
     
@@ -246,3 +247,11 @@ class Plugin:
     def plugin_unload(self, plugin_id: str) -> bool:
         """Unload another plugin."""
         return self._worker.plugin_unload(plugin_id)
+
+    def plugin_status(self, plugin_id: str = None) -> Any:
+        """Get the status of this plugin or another loaded plugin."""
+        return self._worker.plugin_status(plugin_id)
+
+    def plugin_status_all(self) -> Dict[str, Any]:
+        """Get the status of all loaded plugins."""
+        return self._worker.plugin_status_all()

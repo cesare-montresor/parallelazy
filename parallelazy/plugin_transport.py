@@ -344,4 +344,22 @@ class IpcEventPoolManaged:
         slot.produced_at = now
         return slot.to_event()
  
- 
+    def has_busy(self) -> bool:
+        return any(
+            s.produced_at is not None and not s.consumed_event.query()
+            for s in self._slots
+        )
+
+    def wait_all_free(self, timeout: float = 30.0, poll_s: float = 0.005) -> bool:
+        """Attende l'ack del consumer su tutti gli slot. Non reclama slot stale."""
+        deadline = time.monotonic() + timeout
+        while self.has_busy():
+            if time.monotonic() > deadline:
+                busy = sum(
+                    1 for s in self._slots
+                    if s.produced_at is not None and not s.consumed_event.query()
+                )
+                logger.warning(f"drain timeout: {busy}/{self.size} slot senza ack")
+                return False
+            time.sleep(poll_s)
+        return True

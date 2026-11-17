@@ -1,8 +1,11 @@
 import threading
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from parallelazy.plugin import PluginState
-from parallelazy.plugin_data import Channel, CommandType, RequestPluginStop
+from parallelazy.plugin_data import Channel, CommandType, PluginStatus, ProcessStatus, RequestPluginStop
+from parallelazy.plugin_manager import PluginManager
 from parallelazy.plugin_rpc import PluginRPC
 from parallelazy.plugin_worker import PluginWorker
 
@@ -58,6 +61,11 @@ class _LifecyclePlugin:
         self.stop_order.append("stop")
 
 
+class _RaisingCallbackPlugin:
+    def on_scores(self, data):
+        raise RuntimeError("callback failed")
+
+
 def _make_worker(plugin):
     worker = PluginWorker.__new__(PluginWorker)
     worker.plugin_id = "test-plugin"
@@ -79,6 +87,41 @@ def _make_worker(plugin):
 
 
 class PluginLifecycleTests(unittest.TestCase):
+    def test_topic_callback_error_log_identifies_plugin(self):
+        plugin = _RaisingCallbackPlugin()
+        worker = _make_worker(plugin)
+        worker._is_running = True
+        worker.did_start.set()
+        messages = iter(("score", None))
+        subscription = SimpleNamespace(
+            callback=plugin.on_scores,
+            queue=SimpleNamespace(get=lambda: next(messages)),
+        )
+        worker.topic_subscriptions["scores"] = subscription
+
+        with self.assertLogs("parallelazy.plugin_worker", level="ERROR") as logs:
+            worker._topic_listener("scores")
+
+        self.assertIn("plugin 'test-plugin'", logs.output[0])
+        self.assertIn("topic 'scores' callback", logs.output[0])
+
+    def test_closed_topic_queue_log_identifies_plugin(self):
+        worker = _make_worker(None)
+        worker._is_running = True
+        worker.did_start.set()
+        subscription = SimpleNamespace(
+            callback=None,
+            queue=SimpleNamespace(get=Mock(side_effect=FileNotFoundError(2, "No such file or directory"))),
+        )
+        worker.topic_subscriptions["scores"] = subscription
+
+        with self.assertLogs("parallelazy.plugin_worker", level="INFO") as logs:
+            worker._topic_listener("scores")
+
+        self.assertIn("plugin 'test-plugin'", logs.output[0])
+        self.assertIn("topic 'scores' closed", logs.output[0])
+        self.assertIn("No such file or directory", logs.output[0])
+
     def _start_worker(self, worker):
         thread = threading.Thread(target=worker.main)
         thread.start()
@@ -176,6 +219,45 @@ class PluginLifecycleTests(unittest.TestCase):
 
         manager_rpc.shutdown()
         worker_rpc.shutdown()
+
+    def test_worker_can_query_plugin_status_and_all_statuses(self):
+        manager_channel = Channel()
+        worker_channel = Channel(manager_channel.remote_descriptor())
+        manager_rpc = PluginRPC("manager", manager_channel, start_listener=False)
+        worker_rpc = PluginRPC("test-plugin", worker_channel, start_listener=False)
+
+        worker_status = PluginStatus(
+            plugin_id="test-plugin",
+            state="running",
+            is_running=True,
+            subscriptions=0,
+            subscribers=0,
+            published=0,
+            errors=0,
+        )
+        status = ProcessStatus(
+            plugin_id="test-plugin",
+            process_alive=True,
+            process_pid=123,
+            worker_status=worker_status,
+        )
+        manager = PluginManager.__new__(PluginManager)
+        manager.plugin_status = Mock(return_value=status)
+        manager.plugin_status_all = Mock(return_value={"test-plugin": status})
+        manager._init_plugin_rpc(manager_rpc)
+
+        worker = _make_worker(None)
+        worker.rpc = worker_rpc
+        manager_rpc.start_listener()
+        worker_rpc.start_listener()
+        try:
+            self.assertEqual(worker.plugin_status(), status)
+            self.assertEqual(worker.plugin_status_all(), {"test-plugin": status})
+            manager.plugin_status.assert_called_once_with("test-plugin")
+            manager.plugin_status_all.assert_called_once_with()
+        finally:
+            manager_rpc.shutdown()
+            worker_rpc.shutdown()
 
 
 if __name__ == "__main__":

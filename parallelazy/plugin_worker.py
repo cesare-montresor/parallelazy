@@ -18,7 +18,7 @@ import threading
 
 
 from parallelazy.utils import init_debugger, is_debugging_enabled, process_start_spawn, setup_worker_debugging_env
-from parallelazy.plugin_data import  Channel, CommandType, Queue,QueueDescriptor, PendingRequest, PluginStatus,  RequestPluginErrors, RequestPluginStart, RequestPluginStatus, RequestPluginStop, RequestTopicList, Subscriber, Subscription
+from parallelazy.plugin_data import  Channel, CommandType, ProcessStatus, Queue,QueueDescriptor, PendingRequest, PluginStatus,  RequestPluginErrors, RequestPluginStart, RequestPluginStatus, RequestPluginStop, RequestTopicList, Subscriber, Subscription
 from parallelazy.plugin import Plugin, PluginDescriptor, PluginState
 
 from parallelazy.plugin_rpc import  PluginRPC, RequestEnvUpdate, RequestPluginCall, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe, sanitize_for_ipc
@@ -420,6 +420,26 @@ class PluginWorker:
             return False
         return response.result
 
+    def plugin_status(self, plugin_id: str = None) -> Optional[ProcessStatus]:
+        """Get the status of this plugin or another loaded plugin."""
+        pending: PendingRequest = self.rpc.plugin_status(plugin_id)
+        response = pending.wait()
+        if response.error:
+            logger.error(f"Error getting plugin status: {response.error}")
+            self.error_log.append(str(response.error))
+            return None
+        return response.result
+
+    def plugin_status_all(self) -> Dict[str, ProcessStatus]:
+        """Get the status of all loaded plugins."""
+        pending: PendingRequest = self.rpc.plugin_status_all()
+        response = pending.wait()
+        if response.error:
+            logger.error(f"Error getting all plugin statuses: {response.error}")
+            self.error_log.append(str(response.error))
+            return None
+        return response.result
+
 
     """Commands that plugin can send to manager or other plugins.
         > ENV_SET = "env_set"
@@ -747,7 +767,10 @@ class PluginWorker:
                     self.error_log.append(str(e))
                     continue
             except (EOFError, OSError) as e:
-                logger.info(f"Subscription for topic '{topic}' closed, stopping listener thread: {e}")
+                logger.info(
+                    f"Subscription for plugin '{self.plugin_id}' topic '{topic}' "
+                    f"closed, stopping listener thread: {e}"
+                )
                 break
             except Exception as e:
                 logger.error(f"Error in topic '{topic}' listener: {e}", exc_info=True)
@@ -758,7 +781,10 @@ class PluginWorker:
             try:
                 self._invoke_callback(registered.callback, data)
             except Exception as e:
-                logger.error(f"Error in topic '{topic}' callback: {e}", exc_info=True)
+                logger.error(
+                    f"Error in plugin '{self.plugin_id}' topic '{topic}' callback: {e}",
+                    exc_info=True,
+                )
                 self.error_log.append(str(e))
                 continue
     
