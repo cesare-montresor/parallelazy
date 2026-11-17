@@ -5,7 +5,8 @@ Defines the lifecycle, subscription, and service interfaces that all
 plugins must implement or can override.
 """
 
-from typing import Any, Dict, Optional, TYPE_CHECKING, Self
+import logging
+from typing import Any, Callable, Dict, Optional, TYPE_CHECKING, Self
 from enum import Enum
 
 from parallelazy.utils import camel_to_kebab
@@ -59,6 +60,10 @@ class PluginDescriptor:
     author: str = ""
     options: Dict[str, Any] = field(default_factory=dict)
     dependencies: list = field(default_factory=list)
+    work_dir: Optional[str] = None
+    log_dir: Optional[str] = None
+    log_level: Optional[int] = None
+    display_logs: Optional[bool] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert descriptor to dictionary (JSON-serializable)."""
@@ -98,7 +103,7 @@ class Plugin:
     Subclasses must implement:
     - on_start: Initialize plugin resources (optional)
     - on_stop: Clean up resources (optional)
-    - main: Main execution loop (optional)
+    - main: Main-thread work hook, called once after on_start (optional)
     - on_error: Handle errors (optional)
 
 
@@ -127,7 +132,18 @@ class Plugin:
         return {}
 
     @classmethod
-    def Descriptor(cls, version:str, author:str, description:str=None, name:str=None, options: Dict[str, Any] = None) -> PluginDescriptor:
+    def Descriptor(
+        cls,
+        version: str,
+        author: str,
+        description: str = None,
+        name: str = None,
+        options: Dict[str, Any] = None,
+        work_dir: Optional[str] = None,
+        log_dir: Optional[str] = None,
+        log_level: Optional[int] = None,
+        display_logs: Optional[bool] = None,
+    ) -> PluginDescriptor:
         all_options = cls.default_options().copy()
         all_options.update(options or {})
 
@@ -140,6 +156,10 @@ class Plugin:
             package=f"{cls.__module__}",
             class_name=cls.__name__,
             description=description or f"{cls.__doc__}",
+            work_dir=work_dir,
+            log_dir=log_dir,
+            log_level=log_level,
+            display_logs=display_logs,
             
         )
 
@@ -160,9 +180,30 @@ class Plugin:
         self.state = PluginState.INITIALIZED
         self.options = all_options
         self._is_running = False
+        self._work_dir = worker.work_dir
+        self.logger = logging.getLogger(self.__class__.__module__)
+
+    @property
+    def work_dir(self) -> str:
+        """Absolute working directory resolved for this plugin instance."""
+        return self._work_dir
+
+    def set_log_formats(
+        self,
+        file_format: Optional[str] = None,
+        console_format: Optional[str] = None,
+    ) -> None:
+        """Change this worker's file and/or console log format."""
+        self._worker.set_log_formats(file_format, console_format)
     
     
-    def main(self): pass
+    def main(self) -> None:
+        """Run once on the worker's main thread after startup."""
+        pass
+
+    def wait_for_stop(self, timeout: Optional[float] = None) -> bool:
+        """Wait for a stop request, typically from a blocking main() method."""
+        return self._worker.wait_for_stop(timeout)
     
     def on_start(self) -> None:
         """
@@ -191,11 +232,10 @@ class Plugin:
         return self._is_running
     
     def stop(self) -> None:
-        """Stop the plugin."""
-        
+        """Request plugin shutdown; use wait_for_stop() in blocking main() work."""
         self._worker.stop()
 
-    def topic_subscribe(self, topic:str, callback:str) -> None:
+    def topic_subscribe(self, topic:str, callback:Callable) -> None:
         """Subscribe to a data topic or environment variable."""
         self._worker.topic_subscribe(topic, callback)
 
@@ -212,12 +252,41 @@ class Plugin:
         if name is None:
             return self._worker.env_get_all() 
 
-        return self._worker.env_get(name) or default
+        value = self._worker.env_get(name)
+        return default if value is None else value
     
-    def env_subscribe(self, name:str, callback:str) -> None:
+    def env_subscribe(self, name:str, callback:Callable) -> None:
         """Subscribe to changes in an environment variable."""
         self._worker.env_subscribe(name, callback)
     
     def plugin_call(self, plugin_id: str, method_name: str, *args, **kwargs) -> Any:
         """Call a method provided by the manager or another plugin."""
         return self._worker.plugin_call(plugin_id, method_name, *args, **kwargs)
+
+    def plugin_load(
+        self,
+        descriptor: PluginDescriptor,
+        options: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Load a plugin instance from its descriptor."""
+        return self._worker.plugin_load(descriptor, options)
+
+    def plugin_start(self, plugin_id: str) -> bool:
+        """Start another loaded plugin."""
+        return self._worker.plugin_start(plugin_id)
+
+    def plugin_stop(self, plugin_id: str) -> bool:
+        """Stop another loaded plugin."""
+        return self._worker.plugin_stop(plugin_id)
+
+    def plugin_unload(self, plugin_id: str) -> bool:
+        """Unload another plugin."""
+        return self._worker.plugin_unload(plugin_id)
+
+    def plugin_status(self, plugin_id: str = None) -> Any:
+        """Get the status of this plugin or another loaded plugin."""
+        return self._worker.plugin_status(plugin_id)
+
+    def plugin_status_all(self) -> Dict[str, Any]:
+        """Get the status of all loaded plugins."""
+        return self._worker.plugin_status_all()

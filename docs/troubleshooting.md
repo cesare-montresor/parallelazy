@@ -21,7 +21,10 @@ Confirm that:
 3. work is in `main()` or a registered callback; and
 4. the process is alive with `plugin_status()`.
 
-An event-driven plugin is expected to have an empty `main()`.
+`main()` runs once. An event-driven plugin can leave it empty; the worker
+continues waiting for events and a stop request afterward. A blocking `main()`
+should periodically check `self.wait_for_stop(timeout)` so it can shut down
+gracefully.
 
 ## Topics do not arrive
 

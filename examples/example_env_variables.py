@@ -43,12 +43,13 @@ class ConfigWriter(Plugin):
         self.env_set("config.model_type", "resnet50")
 
     def main(self):
-        self.iteration += 1
-        # Periodically update configuration
-        if self.iteration % 10 == 0:
-            new_lr = 0.001 * (0.9 ** (self.iteration // 10))
-            self.env_set("config.learning_rate", new_lr)
-            logger.info(f"[{self.plugin_id}] Updated learning rate to {new_lr:.6f}")
+        while not self.wait_for_stop(timeout=0.1):
+            self.iteration += 1
+            # Periodically update configuration
+            if self.iteration % 10 == 0:
+                new_lr = 0.001 * (0.9 ** (self.iteration // 10))
+                self.env_set("config.learning_rate", new_lr)
+                logger.info(f"[{self.plugin_id}] Updated learning rate to {new_lr:.6f}")
 
     def on_stop(self) -> None:
         logger.info(f"[{self.plugin_id}] ConfigWriter stopped after {self.iteration} iterations")

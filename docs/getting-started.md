@@ -54,7 +54,7 @@ class Greeter(Plugin):
         self.env_set("greeter.ready", True)
 
     def main(self) -> None:
-        # main() is called repeatedly while the plugin is running.
+        # Called once on the worker process's main thread.
         pass
 
     def on_stop(self) -> None:

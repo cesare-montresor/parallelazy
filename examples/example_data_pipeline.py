@@ -44,15 +44,16 @@ from parallelazy.plugin_manager import PluginManager
         self.env_set("pipeline.stage1.count", 0)
 
     def main(self):
-        self.count += 1
-        # Generate raw data
-        raw_data = {
-            "id": self.count,
-            "raw_value": self.count * 10
-        }
-        # Publish to pipeline topic
-        self.topic_publish("pipeline.raw", raw_data)
-        self.env_set("pipeline.stage1.count", self.count, wait=False)
+        while not self.wait_for_stop(timeout=0.01):
+            self.count += 1
+            # Generate raw data
+            raw_data = {
+                "id": self.count,
+                "raw_value": self.count * 10
+            }
+            # Publish to pipeline topic
+            self.topic_publish("pipeline.raw", raw_data)
+            self.env_set("pipeline.stage1.count", self.count, wait=False)
 
     def on_stop(self) -> None:
         logger.info(f"[{self.plugin_id}] DataSource stopped, produced {self.count} items")

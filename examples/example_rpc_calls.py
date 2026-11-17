@@ -98,10 +98,11 @@ class DataConsumer(Plugin):
         self.provider_id = "data-provider"
 
     def main(self):
-        # Every few iterations, request data
-        self.processed += 1
-        if self.processed % 5 == 0:
-            self._fetch_and_process_data()
+        while not self.wait_for_stop(timeout=0.1):
+            # Every few iterations, request data
+            self.processed += 1
+            if self.processed % 5 == 0:
+                self._fetch_and_process_data()
 
     def _fetch_and_process_data(self):
         """Fetch data from provider and process it."""

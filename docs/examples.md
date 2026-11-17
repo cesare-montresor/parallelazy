@@ -5,7 +5,7 @@ can be run from the repository root with `python -m`.
 
 | Module | Demonstrates |
 | --- | --- |
-| `example_count` | Minimal lifecycle and a plugin loop updating shared state |
+| `example_count` | Minimal lifecycle and main-thread work updating shared state |
 | `example_graceful_shutdown` | `on_start`, `on_stop`, and clean unloading |
 | `example_pubsub` | One publisher and one subscriber on a topic |
 | `example_env_variables` | Shared configuration and environment callbacks |
@@ -86,7 +86,8 @@ Copy the smallest relevant example and change:
 
 1. the plugin class and its descriptor metadata;
 2. `on_start()` subscriptions and resource initialization;
-3. `main()` for periodic work, or leave it empty for callback-driven work;
+3. `main()` for synchronous work (loop there and check `wait_for_stop()`), or
+   leave it empty for callback-driven work;
 4. `on_stop()` cleanup and final metrics; and
 5. the manager's load/start/stop/unload sequence.
 

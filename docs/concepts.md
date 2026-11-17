@@ -9,9 +9,10 @@ plugin, and communicates with the manager over pipe-backed channels.
 The lifecycle is deliberately separate:
 
 1. **Load**: create and initialize the worker process.
-2. **Start**: call `on_start()`, mark the plugin running, and begin repeated
-   calls to `main()`.
-3. **Stop**: call `on_stop()`, stop the loop, and close worker communication.
+2. **Start**: call `on_start()`, mark the plugin running, and call `main()`
+   once on the worker process's main thread.
+3. **Stop**: request cooperative shutdown, call `on_stop()` on the worker's
+   main thread, and close worker communication.
 4. **Unload**: remove the process and manager bookkeeping.
 
 `load_plugin()` and `start_plugin()` return `True` on success and `False` on a
@@ -23,13 +24,21 @@ ready.
 Subclass `Plugin` and use these hooks:
 
 - `on_start()`: initialize resources and register subscriptions;
-- `main()`: repeated work loop; it may be empty for event-driven plugins;
+- `main()`: optional synchronous work, called once on the worker's main thread;
 - `on_stop()`: release resources and publish final state;
 - `on_error(error, source=None)`: optional application error hook.
 
-The worker calls `main()` continuously while the plugin is running. Event
-callbacks for topics and environment changes are dispatched by the worker, so
-an event-driven plugin can use `pass` in `main()`.
+An event-driven plugin can return from `main()` immediately; the worker stays
+alive to process topic and environment callbacks until stopped. A plugin that
+does ongoing work in `main()` should periodically check
+`self.wait_for_stop(timeout)` or otherwise return when shutdown is requested.
+The worker calls `on_stop()` after `main()` exits and accepted RPC handlers and
+callbacks have finished.
+
+RPC methods and topic/environment callbacks run on worker threads and may run
+concurrently with `main()` and each other. Accepted handlers and callbacks are
+drained before `on_stop()` runs. Synchronize shared plugin state when it is
+accessed from more than one context.
 
 ## Descriptors and options
 
@@ -54,6 +63,37 @@ restored = PluginDescriptor.from_json(payload)
 
 If multiple instances of one class are needed, give each descriptor a unique
 `name` before loading it.
+
+## Working directories and logs
+
+`PluginManager` accepts `work_dir`, `log_dir`, `log_level`, and
+`display_logs` settings. By default, `work_dir` is the current directory and
+`log_dir` is `logs` beneath it. Each manager creates a unique run folder under
+the log directory:
+
+```text
+<work_dir>/logs/<timestamp>_<run-id>/
+    manager.log
+    <plugin-id>-<suffix>.log
+```
+
+An individual `PluginDescriptor` can override these defaults with
+`work_dir`, `log_dir`, `log_level`, or `display_logs`. Relative plugin working
+directories resolve under the manager's working directory; a relative plugin
+log directory resolves under that plugin's effective working directory.
+Plugins can access their effective working directory as `self.work_dir`.
+
+File records use elapsed time relative to that process's logging setup; each
+file begins with a UTC open-time header. Console records include a short UTC
+wall-clock time and the manager or plugin ID. Console output is enabled by
+default, and the effective log level filters both console and file output.
+
+Plugins can log with `self.logger` or another standard Python logger. The
+manager and each plugin can customize their own file and console formats with
+`set_log_formats(file_format=None, console_format=None)`. These changes are
+process-local and do not propagate to other workers. If a log file or its
+directory is removed while running, the next log write recreates the path and
+continues in a new file.
 
 ## Shared environment
 

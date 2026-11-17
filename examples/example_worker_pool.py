@@ -41,16 +41,17 @@ class TaskQueue(Plugin):
         self.env_set("queue.total_tasks", 0)
 
     def main(self):
-        self.task_id += 1
-        # Generate a task
-        task = {
-            "id": self.task_id,
-            "operation": "process",
-            "complexity": (self.task_id % 3) + 1  # 1-3
-        }
-        # Publish to workers
-        self.topic_publish("tasks.queue", task)
-        self.env_set("queue.total_tasks", self.task_id, wait=False)
+        while not self.wait_for_stop(timeout=0.1):
+            self.task_id += 1
+            # Generate a task
+            task = {
+                "id": self.task_id,
+                "operation": "process",
+                "complexity": (self.task_id % 3) + 1  # 1-3
+            }
+            # Publish to workers
+            self.topic_publish("tasks.queue", task)
+            self.env_set("queue.total_tasks", self.task_id, wait=False)
 
     def on_stop(self) -> None:
         logger.info(f"[{self.plugin_id}] TaskQueue stopped, created {self.task_id} tasks")
