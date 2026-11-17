@@ -732,7 +732,7 @@ class PluginManager:
         if plugin_pub is not None:
             forward_rpc = self._plugins[plugin_pub].rpc
             remote_result = forward_rpc.forward(req)
-            self.logger.info("MANAGER: topic_subscribe: remote_result: %s", remote_result)
+            self.logger.debug(f"topic_subscribe: {remote_result}" )
 
         if not remote_result: return False
 
