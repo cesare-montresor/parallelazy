@@ -87,6 +87,30 @@ def _make_worker(plugin):
 
 
 class PluginLifecycleTests(unittest.TestCase):
+    def test_start_plugins_sequentially(self):
+        manager = PluginManager.__new__(PluginManager)
+        manager.start_plugin = Mock(return_value=True)
+
+        manager.start_plugins(["first", "second"], parallel=False)
+
+        self.assertEqual(
+            [args[0] for args, _ in manager.start_plugin.call_args_list],
+            ["first", "second"],
+        )
+
+    def test_start_plugins_in_parallel(self):
+        manager = PluginManager.__new__(PluginManager)
+        start_barrier = threading.Barrier(3)
+
+        def start_plugin(plugin_id):
+            start_barrier.wait(timeout=2)
+            return True
+
+        manager.start_plugin = Mock(side_effect=start_plugin)
+        manager.start_plugins(["first", "second"], parallel=True)
+
+        self.assertEqual(manager.start_plugin.call_count, 2)
+
     def test_topic_callback_error_log_identifies_topic_without_repeating_plugin_id(self):
         plugin = _RaisingCallbackPlugin()
         worker = _make_worker(plugin)

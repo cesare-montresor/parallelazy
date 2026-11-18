@@ -2,12 +2,13 @@ import io
 import logging
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 from parallelazy.plugin import Plugin, PluginDescriptor
-from parallelazy.plugin_logging import LoggingSession, plugin_log_filename
+from parallelazy.plugin_logging import LoggingSession, configure_worker_output, plugin_log_filename
 from parallelazy.plugin_manager import PluginManager
 from parallelazy.utils import init_debugger
 
@@ -15,12 +16,64 @@ from parallelazy.utils import init_debugger
 class _LoggingProbePlugin(Plugin):
     def on_start(self):
         self.logger.info("plugin logging probe started")
+        print("plugin stdout probe")
+        print("plugin stderr probe", file=sys.stderr)
 
     def main(self):
         self.wait_for_stop()
 
 
+class _FlushRecordingStream(io.StringIO):
+    def __init__(self):
+        super().__init__()
+        self.flush_count = 0
+
+    def flush(self):
+        self.flush_count += 1
+        super().flush()
+
+
 class PluginLoggingTests(unittest.TestCase):
+    def test_worker_streams_are_logged_and_still_written_to_terminal(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log_file = os.path.join(temporary_directory, "worker.log")
+            terminal_stdout = _FlushRecordingStream()
+            terminal_stderr = _FlushRecordingStream()
+            logger = logging.getLogger(f"logging-stream-test.{id(self)}")
+            logger.handlers.clear()
+            logger.propagate = False
+
+            with patch("sys.stdout", terminal_stdout), patch("sys.stderr", terminal_stderr):
+                session = LoggingSession(
+                    logger=logger,
+                    log_file=log_file,
+                    plugin_id="worker-1",
+                    log_level=logging.INFO,
+                    display_logs=True,
+                )
+                capture = configure_worker_output(logger)
+                try:
+                    print("stdout-visible")
+                    self.assertGreater(terminal_stdout.flush_count, 0)
+                    print("stderr-visible", file=sys.stderr)
+                    sys.stderr.write("progress 10%\r")
+                    sys.stderr.write("progress 100%\n")
+                finally:
+                    capture.close()
+                    session.close()
+
+            self.assertEqual(terminal_stdout.getvalue(), "stdout-visible\n")
+            self.assertEqual(
+                terminal_stderr.getvalue(),
+                "stderr-visible\nprogress 10%\rprogress 100%\n",
+            )
+            with open(log_file, encoding="utf-8") as log_stream:
+                contents = log_stream.read()
+            self.assertIn("[stdout] stdout-visible", contents)
+            self.assertIn("[stderr] stderr-visible", contents)
+            self.assertIn("[stderr] progress 10%", contents)
+            self.assertIn("[stderr] progress 100%", contents)
+
     def test_debugger_port_is_logged_once_without_direct_print(self):
         debugpy = Mock()
         debugpy.listen.return_value = (None, 46179)
@@ -91,6 +144,91 @@ class PluginLoggingTests(unittest.TestCase):
             finally:
                 manager._logging.close()
 
+    def test_changing_work_dir_updates_manager_and_plugin_logs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            initial_work_dir = os.path.join(temporary_directory, "initial")
+            work_dir = os.path.join(temporary_directory, "experiment")
+            manager = PluginManager(work_dir=initial_work_dir, display_logs=False)
+            try:
+                manager.work_dir = work_dir
+                manager.logger.info("manager log after work directory change")
+
+                self.assertEqual(manager.work_dir, work_dir)
+                self.assertEqual(manager.log_dir, os.path.join(work_dir, "logs"))
+                self.assertEqual(
+                    manager.run_log_dir,
+                    os.path.join(work_dir, "logs", manager.run_id),
+                )
+                with open(
+                    os.path.join(manager.run_log_dir, "manager.log"),
+                    encoding="utf-8",
+                ) as log_stream:
+                    self.assertIn(
+                        "manager log after work directory change",
+                        log_stream.read(),
+                    )
+
+                settings = manager._plugin_runtime_settings(
+                    PluginDescriptor(
+                        name="worker",
+                        version="1.0",
+                        package="example",
+                        class_name="Worker",
+                    )
+                )
+                self.assertEqual(settings.work_dir, work_dir)
+                self.assertEqual(settings.log_dir, manager.run_log_dir)
+            finally:
+                manager._logging.close()
+
+    def test_changing_log_dir_updates_manager_and_plugin_logs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            work_dir = os.path.join(temporary_directory, "initial")
+            new_work_dir = os.path.join(temporary_directory, "experiment")
+            manager = PluginManager(work_dir=work_dir, display_logs=False)
+            try:
+                manager.log_dir = "experiment-logs"
+                manager.work_dir = new_work_dir
+                manager.logger.info("manager log after log directory change")
+
+                self.assertEqual(manager.log_dir, os.path.join(new_work_dir, "experiment-logs"))
+                self.assertEqual(
+                    manager.run_log_dir,
+                    os.path.join(new_work_dir, "experiment-logs", manager.run_id),
+                )
+                with open(
+                    os.path.join(manager.run_log_dir, "manager.log"),
+                    encoding="utf-8",
+                ) as log_stream:
+                    self.assertIn(
+                        "manager log after log directory change",
+                        log_stream.read(),
+                    )
+
+                settings = manager._plugin_runtime_settings(
+                    PluginDescriptor(
+                        name="worker",
+                        version="1.0",
+                        package="example",
+                        class_name="Worker",
+                    )
+                )
+                self.assertEqual(settings.log_dir, manager.run_log_dir)
+            finally:
+                manager._logging.close()
+
+    def test_log_dir_cannot_change_after_plugin_loading_starts(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            manager = PluginManager(work_dir=temporary_directory, display_logs=False)
+            original_log_dir = manager.log_dir
+            manager._loading_plugins.add("worker")
+            try:
+                with self.assertRaisesRegex(RuntimeError, "log_dir cannot be changed"):
+                    manager.log_dir = "new-logs"
+                self.assertEqual(manager.log_dir, original_log_dir)
+            finally:
+                manager._logging.close()
+
     def test_spawned_plugin_writes_to_its_run_log(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             manager = PluginManager(work_dir=temporary_directory, display_logs=False)
@@ -113,6 +251,8 @@ class PluginLoggingTests(unittest.TestCase):
                 with open(plugin_log, encoding="utf-8") as log_stream:
                     contents = log_stream.read()
                 self.assertIn("plugin logging probe started", contents)
+                self.assertIn("[stdout] plugin stdout probe", contents)
+                self.assertIn("[stderr] plugin stderr probe", contents)
             finally:
                 manager.unload_all_plugins()
                 manager._logging.close()
