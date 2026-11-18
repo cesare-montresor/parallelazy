@@ -66,6 +66,8 @@ from parallelazy.plugin_transport import (
     mark_graph_output,
     sanitize_for_ipc,
 )
+from parallelazy.utils import is_debugpy_attached
+
 from parallelazy.plugin_worker import PluginWorker
 
 __all__ = [
@@ -119,4 +121,5 @@ __all__ = [
     "IpcEventPoolManaged",
     "mark_graph_output",
     "sanitize_for_ipc",
+    "is_debugpy_attached",
 ]

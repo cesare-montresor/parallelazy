@@ -487,10 +487,10 @@ class PluginManager:
             if publisher == plugin_id:
                 del self._topic_publishers[topic]
         
-    def start_all_plugins(self) -> None:
+    def start_all_plugins(self, parallel=True) -> None:
         """Start all loaded plugins."""
-        for plugin_id in list(self._plugins.keys()):
-            self.start_plugin(plugin_id)
+        ids = list(self._plugins.keys())
+        self.start_plugins(ids, parallel=parallel)
     
     def stop_all_plugins(self) -> None:
         """Stop all running plugins."""
