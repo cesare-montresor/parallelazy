@@ -24,6 +24,7 @@ from parallelazy.plugin_logging import (
     LoggingSession,
     PluginRuntimeSettings,
     configure_worker_logging,
+    configure_worker_output,
     default_runtime_settings,
 )
 
@@ -81,9 +82,11 @@ class PluginWorker:
         """
         runtime_settings = runtime_settings or default_runtime_settings()
         logging_session = configure_worker_logging(runtime_settings, plugin_id)
+        output_capture = None
         try:
             if is_debugging_enabled():
                 init_debugger(plugin_id)
+            output_capture = configure_worker_output(logging.getLogger())
 
             worker = PluginWorker(
                 plugin_id,
@@ -96,6 +99,8 @@ class PluginWorker:
             )
             worker.main()
         finally:
+            if output_capture is not None:
+                output_capture.close()
             logging_session.close()
     
     def __init__(

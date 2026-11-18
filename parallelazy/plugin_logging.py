@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 import hashlib
 import logging
 import os
+import re
 import sys
+import threading
 import time
 from typing import List, Optional, TextIO
 
@@ -59,6 +61,128 @@ def default_runtime_settings() -> PluginRuntimeSettings:
     )
 
 
+class _CapturedStreamConsoleFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, "_parallelazy_captured_stream", False)
+
+
+class _TeeTextStream:
+    """Mirror worker stream writes to the original stream and its log file."""
+
+    def __init__(self, stream: TextIO, logger: logging.Logger, label: str):
+        self._stream = stream
+        self._logger = logger
+        self._label = label
+        self._buffer = ""
+        self._lock = threading.RLock()
+        self._logging = threading.local()
+
+    @property
+    def encoding(self):
+        return self._stream.encoding
+
+    @property
+    def errors(self):
+        return self._stream.errors
+
+    @property
+    def buffer(self):
+        return self._stream.buffer
+
+    @property
+    def name(self):
+        return self._stream.name
+
+    @property
+    def closed(self):
+        return self._stream.closed
+
+    def isatty(self) -> bool:
+        return self._stream.isatty()
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    def writable(self) -> bool:
+        return self._stream.writable()
+
+    def write(self, text: str) -> int:
+        if not isinstance(text, str):
+            raise TypeError("write() argument must be str")
+        with self._lock:
+            written = self._stream.write(text)
+            if "\r" in text or "\n" in text:
+                self._stream.flush()
+            if not getattr(self._logging, "active", False):
+                self._capture_complete_lines(text)
+            return written
+
+    def _capture_complete_lines(self, text: str) -> None:
+        for index, character in enumerate(text):
+            if character in ("\r", "\n"):
+                if character == "\n" and index > 0 and text[index - 1] == "\r":
+                    continue
+                self._emit_buffer()
+            else:
+                self._buffer += character
+
+    def _emit_buffer(self) -> None:
+        line = self._buffer
+        self._buffer = ""
+        self._log_line(line)
+
+    def _log_line(self, line: str) -> None:
+        self._logging.active = True
+        try:
+            self._logger.info(
+                "[%s] %s",
+                self._label,
+                line,
+                extra={"_parallelazy_captured_stream": True},
+            )
+        finally:
+            self._logging.active = False
+
+    def flush(self) -> None:
+        with self._lock:
+            self._stream.flush()
+            if self._buffer and not getattr(self._logging, "active", False):
+                self._emit_buffer()
+
+    def close(self) -> None:
+        self.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+class WorkerOutputCapture:
+    """Restore worker streams after teeing their output into the worker log."""
+
+    def __init__(self, logger: logging.Logger):
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
+        self.stdout = _TeeTextStream(self._original_stdout, logger, "stdout")
+        self.stderr = _TeeTextStream(self._original_stderr, logger, "stderr")
+        sys.stdout = self.stdout
+        sys.stderr = self.stderr
+
+    def close(self) -> None:
+        try:
+            self.stdout.flush()
+            self.stderr.flush()
+        finally:
+            if sys.stdout is self.stdout:
+                sys.stdout = self._original_stdout
+            if sys.stderr is self.stderr:
+                sys.stderr = self._original_stderr
+
+
+def configure_worker_output(logger: logging.Logger) -> WorkerOutputCapture:
+    """Mirror worker stdout and stderr to both the terminal and plugin log."""
+    return WorkerOutputCapture(logger)
+
+
 def _format_elapsed(seconds: float) -> str:
     milliseconds = max(0, int(seconds * 1000))
     hours, remainder = divmod(milliseconds, 3_600_000)
@@ -94,9 +218,9 @@ class _RecoveringFileHandler(logging.Handler):
         self.stream: Optional[TextIO] = None
         self._open_stream()
 
-    def _open_stream(self) -> None:
-        os.makedirs(os.path.dirname(self.base_filename), exist_ok=True)
-        stream = open(self.base_filename, "a", encoding="utf-8")
+    def _create_stream(self, filename: str) -> TextIO:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        stream = open(filename, "a", encoding="utf-8")
         try:
             stream.write(f"# Log opened: {_utc_timestamp()}{self.terminator}")
             stream.write(
@@ -107,7 +231,26 @@ class _RecoveringFileHandler(logging.Handler):
         except Exception:
             stream.close()
             raise
-        self.stream = stream
+        return stream
+
+    def _open_stream(self) -> None:
+        self.stream = self._create_stream(self.base_filename)
+
+    def set_filename(self, filename: str) -> None:
+        filename = os.path.abspath(filename)
+        if filename == self.base_filename:
+            return
+
+        stream = self._create_stream(filename)
+        self.acquire()
+        try:
+            previous_stream = self.stream
+            self.base_filename = filename
+            self.stream = stream
+            if previous_stream is not None:
+                previous_stream.close()
+        finally:
+            self.release()
 
     def _close_stream(self) -> None:
         stream = self.stream
@@ -225,6 +368,7 @@ class LoggingSession:
             console_handler = logging.StreamHandler(sys.stdout)
             console_handler.setLevel(log_level)
             console_handler.addFilter(self._context_filter)
+            console_handler.addFilter(_CapturedStreamConsoleFilter())
             console_handler.setFormatter(
                 _make_formatter(self.console_format, CONSOLE_DATE_FORMAT)
             )
@@ -251,6 +395,11 @@ class LoggingSession:
 
         self.file_format = new_file_format
         self.console_format = new_console_format
+
+    def set_log_file(self, log_file: str) -> None:
+        for handler in self._handlers:
+            if isinstance(handler, _RecoveringFileHandler):
+                handler.set_filename(log_file)
 
     def close(self) -> None:
         for handler in self._handlers:

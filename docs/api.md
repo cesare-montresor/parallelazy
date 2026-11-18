@@ -113,6 +113,10 @@ Descriptor values override the corresponding manager defaults for that plugin.
 File and console output use the effective log level; console output is enabled
 by default. The manager and plugins can independently change their process's
 formats with `set_log_formats(file_format=None, console_format=None)`.
+The manager's `work_dir` and `log_dir` properties can be changed before plugin
+loading starts. Changing either redirects manager logs and affects the defaults
+used for subsequently loaded plugins; both settings are fixed once loading
+begins.
 
 ### Lifecycle
 
@@ -121,6 +125,7 @@ formats with `set_log_formats(file_format=None, console_format=None)`.
 | `load_plugin(descriptor, options=None)` | `bool` |
 | `load_plugins(descriptors, parallel=True)` | `None` |
 | `start_plugin(plugin_id)` | `bool` |
+| `start_plugins(plugin_ids, parallel=True)` | `None` |
 | `stop_plugin(plugin_id)` | `bool` |
 | `unload_plugin(plugin_id)` | `bool` |
 | `start_all_plugins()` | `None` |

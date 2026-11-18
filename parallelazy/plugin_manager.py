@@ -77,13 +77,14 @@ class PluginManager:
         if isinstance(log_level, bool) or not isinstance(log_level, int):
             raise TypeError("log_level must be an integer logging level")
 
-        self.work_dir = resolve_directory(work_dir or os.getcwd())
-        self.log_dir = resolve_directory(log_dir, self.work_dir)
+        self._work_dir = resolve_directory(work_dir or os.getcwd())
+        self._log_dir_setting = log_dir
+        self._log_dir = resolve_directory(log_dir, self._work_dir)
         self.log_level = log_level
         self.display_logs = display_logs
         self.run_id = create_run_id()
         self.run_log_dir = os.path.join(self.log_dir, self.run_id)
-        os.makedirs(self.work_dir, exist_ok=True)
+        os.makedirs(self._work_dir, exist_ok=True)
         os.makedirs(self.run_log_dir, exist_ok=True)
 
         self._logging = configure_manager_logging(
@@ -111,6 +112,51 @@ class PluginManager:
 
         if self.worker_pydebug:
             setup_worker_debugging_env()
+
+    @property
+    def work_dir(self) -> str:
+        """Base working directory for the manager and its plugins."""
+        return self._work_dir
+
+    @property
+    def log_dir(self) -> str:
+        """Base directory for manager and plugin log files."""
+        return self._log_dir
+
+    @log_dir.setter
+    def log_dir(self, path: str) -> None:
+        log_dir = resolve_directory(path, self.work_dir)
+        with self._plugins_lock:
+            if log_dir == self._log_dir:
+                self._log_dir_setting = path
+                return
+            if self._plugins or self._loading_plugins:
+                raise RuntimeError("log_dir cannot be changed after plugin loading starts")
+
+            self._update_log_dir(log_dir)
+            self._log_dir_setting = path
+
+    @work_dir.setter
+    def work_dir(self, path: str) -> None:
+        work_dir = resolve_directory(path)
+        if work_dir == self._work_dir:
+            return
+
+        with self._plugins_lock:
+            if self._plugins or self._loading_plugins:
+                raise RuntimeError("work_dir cannot be changed after plugin loading starts")
+
+            log_dir = resolve_directory(self._log_dir_setting, work_dir)
+            os.makedirs(work_dir, exist_ok=True)
+            self._update_log_dir(log_dir)
+            self._work_dir = work_dir
+
+    def _update_log_dir(self, log_dir: str) -> None:
+        run_log_dir = os.path.join(log_dir, self.run_id)
+        os.makedirs(run_log_dir, exist_ok=True)
+        self._logging.set_log_file(os.path.join(run_log_dir, "manager.log"))
+        self._log_dir = log_dir
+        self.run_log_dir = run_log_dir
 
     def set_log_formats(
         self,
@@ -318,6 +364,32 @@ class PluginManager:
         except Exception as e:
             self.logger.error(f"Error starting plugin {plugin_id}: {e}")
             return False
+
+    def start_plugins(self, plugin_ids: List[str], parallel: bool = True) -> None:
+        """
+        Start multiple loaded plugins.
+
+        Args:
+            plugin_ids: Identifiers of the plugins to start
+            parallel: Whether to start plugins in parallel
+        """
+        if parallel:
+            barrier = mp.Barrier(len(plugin_ids) + 1)
+            for plugin_id in plugin_ids:
+                thread = threading.Thread(
+                    target=self._start_plugin_thread,
+                    args=(plugin_id, barrier),
+                )
+                thread.start()
+            barrier.wait()
+        else:
+            for plugin_id in plugin_ids:
+                self.start_plugin(plugin_id)
+
+    def _start_plugin_thread(self, plugin_id: str, barrier: 'mp.Barrier') -> None:
+        """Start a plugin in a thread and wait for the other starts to finish."""
+        self.start_plugin(plugin_id)
+        barrier.wait()
         
     
     def stop_plugin(self, plugin_id: str) -> bool:
@@ -732,7 +804,7 @@ class PluginManager:
         if plugin_pub is not None:
             forward_rpc = self._plugins[plugin_pub].rpc
             remote_result = forward_rpc.forward(req)
-            self.logger.info("MANAGER: topic_subscribe: remote_result: %s", remote_result)
+            self.logger.debug(f"topic_subscribe: {remote_result}" )
 
         if not remote_result: return False
 

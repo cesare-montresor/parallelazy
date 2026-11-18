@@ -77,6 +77,12 @@ the log directory:
     <plugin-id>-<suffix>.log
 ```
 
+You can change `manager.work_dir` and `manager.log_dir` before loading plugins.
+Relative manager log directories are resolved under the current working
+directory, and changing either setting redirects manager logging to the
+corresponding run's `manager.log`. Neither setting can be changed after plugin
+loading starts.
+
 An individual `PluginDescriptor` can override these defaults with
 `work_dir`, `log_dir`, `log_level`, or `display_logs`. Relative plugin working
 directories resolve under the manager's working directory; a relative plugin
@@ -94,6 +100,13 @@ manager and each plugin can customize their own file and console formats with
 process-local and do not propagate to other workers. If a log file or its
 directory is removed while running, the next log write recreates the path and
 continues in a new file.
+
+Worker standard output and error are mirrored to both the terminal and the
+plugin log. Newline- and carriage-return-delimited writes are logged as
+`[stdout]` or `[stderr]` records and flushed promptly to the terminal. Libraries
+such as `tqdm` may suppress progress bars when their output stream is not a
+TTY; pass `disable=False` when you want progress output in a non-TTY terminal
+or IDE console.
 
 ## Shared environment
 
