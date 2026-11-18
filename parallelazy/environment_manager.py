@@ -8,6 +8,7 @@ and broadcasting updates to interested plugins.
 from typing import Any, Dict
 from threading import Lock
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,9 @@ class EnvironmentManager:
         """Initialize environment manager."""
         self._env: Dict[str, Any] = {}
         self._lock = Lock()
+        self._monitoring_enabled = False
+        self._write_counts: Dict[str, int] = {}
+        self._last_write_times: Dict[str, float] = {}
     
     def get(self, key: str, default: Any = None) -> Any:
         """Get environment variable value."""
@@ -30,6 +34,36 @@ class EnvironmentManager:
         """Set environment variable."""
         with self._lock:
             self._env[key] = value
+            if self._monitoring_enabled:
+                self._write_counts[key] = self._write_counts.get(key, 0) + 1
+                self._last_write_times[key] = time.monotonic()
+
+    def begin_monitoring(self) -> None:
+        """Start collecting environment write counters."""
+        with self._lock:
+            self._monitoring_enabled = True
+            self._write_counts = {key: 0 for key in self._env}
+            self._last_write_times = {}
+
+    def end_monitoring(self) -> None:
+        """Stop collecting environment write counters."""
+        with self._lock:
+            self._monitoring_enabled = False
+            self._write_counts = {}
+            self._last_write_times = {}
+
+    def monitoring_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """Return environment metadata and write counters without values."""
+        with self._lock:
+            return {
+                key: {
+                    "type": type(value).__name__,
+                    "stored_size": __import__("sys").getsizeof(value),
+                    "write_count": self._write_counts.get(key, 0),
+                    "last_write": self._last_write_times.get(key),
+                }
+                for key, value in self._env.items()
+            }
     
     def get_all(self) -> Dict[str, Any]:
         """Get all environment variables."""

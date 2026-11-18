@@ -67,6 +67,14 @@ from parallelazy.plugin_transport import (
     sanitize_for_ipc,
 )
 from parallelazy.utils import is_debugpy_attached
+from parallelazy.plugin_monitor import (
+    CapabilityAvailability,
+    EnvironmentMetric,
+    MonitoringSnapshot,
+    PipelineMonitor,
+    ProcessMetric,
+    TopicMetric,
+)
 
 from parallelazy.plugin_worker import PluginWorker
 
@@ -122,4 +130,10 @@ __all__ = [
     "mark_graph_output",
     "sanitize_for_ipc",
     "is_debugpy_attached",
+    "CapabilityAvailability",
+    "EnvironmentMetric",
+    "MonitoringSnapshot",
+    "PipelineMonitor",
+    "ProcessMetric",
+    "TopicMetric",
 ]

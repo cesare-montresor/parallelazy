@@ -66,6 +66,42 @@ for layer_name in layer_names:
         self.plugin_start(descriptor.name)
 ```
 
+## Pipeline monitoring
+
+Monitoring is optional and read-only. It does not read topic payloads or
+change queue delivery.
+
+```python
+monitor = manager.enable_monitoring(sample_interval=1.0)
+snapshot = manager.get_monitoring_snapshot()
+manager.print_monitoring_report()
+manager.disable_monitoring()
+```
+
+`enable_monitoring()` starts one background sampler. `disable_monitoring()`
+stops it synchronously. The sampler remains active until disabled even if no
+report is currently printed. `get_monitoring_snapshot()` returns the latest
+sample while enabled and performs a one-off sample when disabled.
+
+For an interactive terminal, a hotkey can print the latest snapshot:
+
+```python
+manager.enable_report_hotkey("m")
+# Later:
+manager.disable_report_hotkey()
+```
+
+Hotkey capture is opt-in and only available for an interactive TTY.
+`MonitoringSnapshot` contains topic, plugin process, environment, and backend
+availability records. Pending pipe bytes are the primary backlog measurement;
+message counts are not estimated.
+
+Process metrics require `psutil` and cover the worker plus live descendants.
+NVIDIA GPU metrics require `nvidia-ml-py`. Missing optional dependencies are
+reported with the package-specific installation command. Environment reports
+show key names, value types, shallow stored sizes, subscriber counts, write
+rates, and last-write age; values themselves are not included.
+
 ## `parallelazy.plugin.PluginDescriptor`
 
 Dataclass fields:

@@ -19,6 +19,7 @@ compatible with PyTorch and CUDA process-start requirements.
 - [API reference](api.md)
 - [Examples and usage patterns](examples.md)
 - [Troubleshooting and operational notes](troubleshooting.md)
+- [Read-only pipeline monitor handout](monitoring_tool_analysys.md)
 
 ## Source links
 

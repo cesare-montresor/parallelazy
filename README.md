@@ -65,6 +65,23 @@ if __name__ == "__main__":
     main()
 ```
 
+## Pipeline monitoring
+
+Enable an optional read-only view of topic backlog, plugin process resources,
+and shared environment activity:
+
+```python
+manager.enable_monitoring(sample_interval=1.0)
+snapshot = manager.get_monitoring_snapshot()
+manager.print_monitoring_report()
+manager.disable_monitoring()
+```
+
+The monitor never reads or changes topic payloads. Topic backlog is reported as
+pending pipe bytes. Process metrics use `psutil` when installed, and NVIDIA GPU
+metrics use `nvidia-ml-py`; missing optional dependencies are identified with
+their install command.
+
 ## Documentation
 
 Read the [documentation index](docs/index.md) for installation, concepts,
