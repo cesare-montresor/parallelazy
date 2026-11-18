@@ -45,6 +45,7 @@ class ProcessMetric:
     gpu_available: bool
     process_reason: Optional[str] = None
     gpu_reason: Optional[str] = None
+    gpu_dependency_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -374,6 +375,7 @@ class PipelineMonitor:
                     gpu_available=self._gpu_status.available,
                     process_reason=None if self._psutil is not None else self._psutil_status.reason,
                     gpu_reason=None if self._gpu_status.available else self._gpu_status.reason,
+                    gpu_dependency_missing=self._gpu_status.install_command is not None,
                 )
             )
 
@@ -386,19 +388,28 @@ class PipelineMonitor:
         try:
             import pynvml
 
-            pynvml.nvmlInit()
-            self._pynvml = pynvml
-            self._gpu_status = CapabilityAvailability("GPU metrics", True)
-            return True
-        except Exception:
+        except ImportError:
             self._gpu_status = CapabilityAvailability(
                 "GPU metrics",
                 False,
-                "NVML support is not installed or could not initialize.",
+                "NVML support is not installed.",
                 "nvidia-ml-py",
                 "pip install nvidia-ml-py",
             )
             return False
+        try:
+            pynvml.nvmlInit()
+        except Exception as exc:
+            self._gpu_status = CapabilityAvailability(
+                "GPU metrics",
+                False,
+                "NVML could not initialize: %s" % exc,
+            )
+            return False
+
+        self._pynvml = pynvml
+        self._gpu_status = CapabilityAvailability("GPU metrics", True)
+        return True
 
     def _sample_gpu(
         self,
@@ -438,8 +449,6 @@ class PipelineMonitor:
                 "GPU metrics",
                 False,
                 "NVML could not collect GPU metrics: %s" % exc,
-                "nvidia-ml-py",
-                "pip install nvidia-ml-py",
             )
             return None, None
 
@@ -481,22 +490,19 @@ class PipelineMonitor:
 
     def print_report(self, snapshot: Optional[MonitoringSnapshot] = None) -> None:
         snapshot = snapshot or self.get_snapshot()
-        lines = ["Parallelazy pipeline monitor"]
+        lines = ["Parallelazy pipeline monitor", ""]
 
-        lines.append("Topics:")
-        if not snapshot.topics:
-            lines.append("  none")
+        topic_rows = []
         for metric in snapshot.topics:
             publisher = metric.publisher or "unknown"
             if metric.pending_bytes is None:
-                pending = "unavailable"
+                pending = "-"
                 trend = "-"
             else:
                 pending = "%d B" % metric.pending_bytes
-                trend = metric.trend or "first sample"
-            lines.append(
-                "  %s | publisher=%s subscriber=%s | pending=%s | trend=%s"
-                % (
+                trend = metric.trend or "-"
+            topic_rows.append(
+                (
                     metric.topic,
                     publisher,
                     metric.subscriber,
@@ -504,42 +510,69 @@ class PipelineMonitor:
                     trend,
                 )
             )
+        lines.extend(
+            self._format_table(
+                "Topics",
+                ("Topic", "Publisher", "Subscriber", "Pending bytes", "Trend"),
+                topic_rows,
+            )
+        )
+        lines.append("")
 
-        lines.append("Plugins:")
-        if not snapshot.processes:
-            lines.append("  none")
+        process_rows = []
         for metric in snapshot.processes:
-            cpu = "unavailable" if metric.cpu_percent is None else "%.1f%%" % metric.cpu_percent
-            rss = "unavailable" if metric.rss_bytes is None else self._format_bytes(metric.rss_bytes)
+            if metric.process_available:
+                pid = metric.root_pid if metric.root_pid is not None else "-"
+                descendants = str(metric.descendant_count)
+                cpu = "-" if metric.cpu_percent is None else "%.1f%%" % metric.cpu_percent
+                rss = "-" if metric.rss_bytes is None else self._format_bytes(metric.rss_bytes)
+            else:
+                pid = "unavailable"
+                descendants = "unavailable"
+                cpu = "unavailable"
+                rss = "unavailable"
             gpu_memory = (
-                "unavailable"
+                ("unavailable" if metric.gpu_dependency_missing else "-")
                 if metric.gpu_memory_bytes is None
                 else self._format_bytes(metric.gpu_memory_bytes)
             )
             gpu_util = (
-                "unavailable"
+                ("unavailable" if metric.gpu_dependency_missing else "-")
                 if metric.gpu_utilization_percent is None
                 else "%.1f%%" % metric.gpu_utilization_percent
             )
-            lines.append(
-                "  %s | pid=%s | worker+descendants=%d | CPU=%s | RSS=%s | GPU memory=%s | GPU util=%s"
-                % (
+            process_rows.append(
+                (
                     metric.plugin_id,
-                    metric.root_pid if metric.root_pid is not None else "-",
-                    metric.descendant_count,
+                    pid,
+                    descendants,
                     cpu,
                     rss,
                     gpu_memory,
                     gpu_util,
                 )
             )
+        lines.extend(
+            self._format_table(
+                "Plugins",
+                (
+                    "Plugin",
+                    "PID",
+                    "Descendants",
+                    "CPU",
+                    "RSS",
+                    "GPU memory",
+                    "GPU util",
+                ),
+                process_rows,
+            )
+        )
+        lines.append("")
 
-        lines.append("Environment:")
-        if not snapshot.environment:
-            lines.append("  none")
+        environment_rows = []
         for metric in snapshot.environment:
             writes = (
-                "unavailable"
+                "-"
                 if metric.writes_per_second is None
                 else "%.2f/s" % metric.writes_per_second
             )
@@ -548,9 +581,8 @@ class PipelineMonitor:
                 if metric.last_write_seconds_ago is None
                 else "%.1fs ago" % metric.last_write_seconds_ago
             )
-            lines.append(
-                "  %s | type=%s | writes=%s | size=%s | subscribers=%d | last=%s"
-                % (
+            environment_rows.append(
+                (
                     metric.key,
                     metric.value_type,
                     writes,
@@ -559,10 +591,26 @@ class PipelineMonitor:
                     age,
                 )
             )
+        lines.extend(
+            self._format_table(
+                "Environment",
+                (
+                    "Key",
+                    "Type",
+                    "Writes/s",
+                    "Stored size",
+                    "Subscribers",
+                    "Last write",
+                ),
+                environment_rows,
+            )
+        )
 
         for capability in snapshot.capabilities:
             if not capability.available:
-                notice = "%s unavailable" % capability.capability
+                lines.append("")
+                state = "unavailable" if capability.install_command else "not collected"
+                notice = "%s %s" % (capability.capability, state)
                 if capability.reason:
                     notice += ": %s" % capability.reason
                 if capability.install_command:
@@ -570,6 +618,38 @@ class PipelineMonitor:
                 lines.append(notice)
 
         print("\n".join(lines), flush=True)
+
+    @staticmethod
+    def _format_table(
+        title: str,
+        headers: Iterable[str],
+        rows: Iterable[Iterable[Any]],
+    ) -> List[str]:
+        headers = tuple(headers)
+        rows = [tuple(str(value) for value in row) for row in rows]
+        if not rows:
+            rows = [tuple("-" for _ in headers)]
+
+        widths = [
+            max(len(header), *(len(row[index]) for row in rows))
+            for index, header in enumerate(headers)
+        ]
+        separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+
+        def render_row(values: Iterable[str]) -> str:
+            return "| " + " | ".join(
+                value.center(width) if value == "-" else value.ljust(width)
+                for value, width in zip(values, widths)
+            ) + " |"
+
+        return [
+            title + ":",
+            separator,
+            render_row(headers),
+            separator,
+            *(render_row(row) for row in rows),
+            separator,
+        ]
 
     @staticmethod
     def _format_bytes(value: int) -> str:

@@ -1,8 +1,10 @@
+import io
 import os
 import sys
 import time
 import threading
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import Mock
 from types import SimpleNamespace
 
@@ -11,8 +13,12 @@ from parallelazy.plugin_data import QueueDescriptor
 from parallelazy.plugin_manager import PluginManager
 from parallelazy.plugin_monitor import (
     CapabilityAvailability,
+    EnvironmentMetric,
     MonitoringAdapter,
+    MonitoringSnapshot,
     PipelineMonitor,
+    ProcessMetric,
+    TopicMetric,
 )
 
 
@@ -39,6 +45,134 @@ class _FakeManager:
 
 
 class PluginMonitoringTests(unittest.TestCase):
+    def test_report_renders_three_tables_with_column_headers(self):
+        manager = _FakeManager()
+        monitor = PipelineMonitor(MonitoringAdapter(manager))
+        snapshot = MonitoringSnapshot(
+            sampled_at=0.0,
+            topics=(
+                TopicMetric("scores", "eval", "worker", 128, "growing", True),
+            ),
+            processes=(
+                ProcessMetric(
+                    "worker",
+                    123,
+                    True,
+                    "running",
+                    1,
+                    25.0,
+                    1024,
+                    2048,
+                    None,
+                    True,
+                    True,
+                ),
+            ),
+            environment=(
+                EnvironmentMetric("stage", "str", 2.0, 64, 1, 0.5),
+            ),
+            capabilities=(),
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            monitor.print_report(snapshot)
+
+        report = output.getvalue()
+        self.assertIn("Topics:", report)
+        self.assertIn("| Topic  | Publisher | Subscriber | Pending bytes | Trend   |", report)
+        self.assertIn("| scores | eval      | worker     | 128 B         | growing |", report)
+        self.assertIn("| Plugin | PID | Descendants | CPU", report)
+        self.assertIn("| Key   | Type | Writes/s | Stored size | Subscribers | Last write |", report)
+        self.assertEqual(sum(line.startswith("+") for line in report.splitlines()), 9)
+
+    def test_report_uses_centered_dashes_for_unavailable_samples(self):
+        monitor = PipelineMonitor(MonitoringAdapter(_FakeManager()))
+        snapshot = MonitoringSnapshot(
+            sampled_at=0.0,
+            topics=(TopicMetric("scores", None, "worker", None, None, False),),
+            processes=(
+                ProcessMetric(
+                    "worker",
+                    123,
+                    True,
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    True,
+                    True,
+                ),
+            ),
+            environment=(EnvironmentMetric("stage", "str", None, 64, 0, None),),
+            capabilities=(
+                CapabilityAvailability(
+                    "pipe backlog",
+                    False,
+                    "Pipe byte inspection is unsupported on this platform.",
+                ),
+            ),
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            monitor.print_report(snapshot)
+        report = output.getvalue()
+
+        self.assertIn("| scores | unknown   | worker", report)
+        self.assertIn("|   -   |", report)
+        self.assertIn("Writes/s", report)
+        self.assertNotIn("unavailable", report)
+        self.assertIn("pipe backlog not collected:", report)
+
+    def test_report_reserves_unavailable_for_missing_dependencies(self):
+        monitor = PipelineMonitor(MonitoringAdapter(_FakeManager()))
+        snapshot = MonitoringSnapshot(
+            sampled_at=0.0,
+            topics=(),
+            processes=(
+                ProcessMetric(
+                    "worker",
+                    123,
+                    True,
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    False,
+                    False,
+                    gpu_dependency_missing=True,
+                ),
+            ),
+            environment=(),
+            capabilities=(
+                CapabilityAvailability(
+                    "process metrics",
+                    False,
+                    "psutil is not installed.",
+                    "psutil",
+                    "pip install psutil",
+                ),
+                CapabilityAvailability(
+                    "GPU metrics",
+                    False,
+                    "NVML support is not installed.",
+                    "nvidia-ml-py",
+                    "pip install nvidia-ml-py",
+                ),
+            ),
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            monitor.print_report(snapshot)
+        report = output.getvalue()
+
+        self.assertIn("unavailable", report)
+        self.assertIn("pip install psutil", report)
+        self.assertIn("pip install nvidia-ml-py", report)
+
     def test_manager_enable_disable_lifecycle_is_repeatable(self):
         manager = PluginManager.__new__(PluginManager)
         manager._monitor_lock = threading.Lock()
