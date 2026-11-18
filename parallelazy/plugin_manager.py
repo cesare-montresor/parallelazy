@@ -104,6 +104,8 @@ class PluginManager:
         self._env_subscribers: Dict[str, List[str]] = {}  # env_key -> [plugin_id, ...]
         
         self._env = EnvironmentManager()
+        self._monitor_lock = threading.Lock()
+        self._monitor = None
         
         self.timeout_request = timeout_request
         self.worker_pydebug = is_debugpy_attached()
@@ -438,6 +440,7 @@ class PluginManager:
             True if unloaded successfully
         """
         try:
+            self.disable_monitoring()
             if plugin_id in self._plugins:
                 info = self._plugins[plugin_id]
                 if info.process.is_alive() and not info.stop_confirmed:
@@ -487,10 +490,10 @@ class PluginManager:
             if publisher == plugin_id:
                 del self._topic_publishers[topic]
         
-    def start_all_plugins(self) -> None:
+    def start_all_plugins(self, parallel=True) -> None:
         """Start all loaded plugins."""
-        for plugin_id in list(self._plugins.keys()):
-            self.start_plugin(plugin_id)
+        ids = list(self._plugins.keys())
+        self.start_plugins(ids, parallel=parallel)
     
     def stop_all_plugins(self) -> None:
         """Stop all running plugins."""
@@ -500,6 +503,7 @@ class PluginManager:
     
     def unload_all_plugins(self) -> None:
         """Shut down the plugin manager and all plugins."""
+        self.disable_monitoring()
         self.stop_all_plugins()
         for plugin_id in list(self._plugins.keys()):
             self.unload_plugin(plugin_id)
@@ -564,6 +568,91 @@ class PluginManager:
     def plugin_list(self) -> List[str]:
         """List all loaded plugin IDs."""
         return list(self._plugins.keys())
+
+    def enable_monitoring(
+        self,
+        sample_interval: float = 1.0,
+    ):
+        """Enable optional, read-only pipeline monitoring."""
+        from parallelazy.plugin_monitor import MonitoringAdapter, PipelineMonitor
+
+        if isinstance(sample_interval, bool) or not isinstance(sample_interval, (int, float)):
+            raise TypeError("sample_interval must be a number")
+        if sample_interval <= 0:
+            raise ValueError("sample_interval must be greater than zero")
+
+        with self._monitor_lock:
+            if self._monitor is not None:
+                self._monitor.start()
+                return self._monitor
+
+            monitor = PipelineMonitor(
+                MonitoringAdapter(self),
+                sample_interval=sample_interval,
+                logger=self.logger,
+            )
+            self._monitor = monitor
+
+        self._env.begin_monitoring()
+        monitor.start()
+        return monitor
+
+    def disable_monitoring(self) -> None:
+        """Synchronously stop pipeline monitoring."""
+        with self._monitor_lock:
+            monitor = self._monitor
+        if monitor is not None:
+            monitor.stop()
+        self._env.end_monitoring()
+        with self._monitor_lock:
+            self._monitor = None
+
+    def get_monitoring_snapshot(self):
+        """Return a point-in-time monitoring snapshot."""
+        from parallelazy.plugin_monitor import MonitoringAdapter, PipelineMonitor
+
+        with self._monitor_lock:
+            monitor = self._monitor
+        if monitor is not None:
+            return monitor.get_snapshot()
+
+        monitor = PipelineMonitor(
+            MonitoringAdapter(self),
+            sample_interval=1.0,
+            logger=self.logger,
+        )
+        return monitor.sample()
+
+    def print_monitoring_report(self) -> None:
+        """Print the latest monitoring snapshot without triggering a new sample."""
+        from parallelazy.plugin_monitor import MonitoringAdapter, PipelineMonitor
+
+        with self._monitor_lock:
+            monitor = self._monitor
+        if monitor is not None:
+            monitor.print_report()
+            return
+
+        monitor = PipelineMonitor(
+            MonitoringAdapter(self),
+            sample_interval=1.0,
+            logger=self.logger,
+        )
+        monitor.print_report(monitor.sample())
+
+    def enable_report_hotkey(self, key: str = "m") -> bool:
+        """Enable a hotkey that prints monitoring reports in an interactive TTY."""
+        monitor = self._monitor
+        if monitor is None:
+            monitor = self.enable_monitoring()
+        return monitor.start_hotkey(key)
+
+    def disable_report_hotkey(self) -> None:
+        """Disable the report hotkey and restore terminal input state."""
+        with self._monitor_lock:
+            monitor = self._monitor
+        if monitor is not None:
+            monitor.stop_hotkey()
     
     
     
