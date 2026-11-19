@@ -91,6 +91,23 @@ def _make_worker(plugin):
 
 
 class PluginLifecycleTests(unittest.TestCase):
+    def test_environment_update_callback_receives_value_not_name(self):
+        callback_values = []
+        worker = _make_worker(None)
+        worker.env_subscriptions = {
+            "config.batch_size": callback_values.append,
+        }
+
+        request = SimpleNamespace(
+            name="config.batch_size",
+            value=64,
+        )
+
+        result = worker._respond_env_update(Mock(), request)
+
+        self.assertTrue(result)
+        self.assertEqual(callback_values, [64])
+
     def test_start_plugins_sequentially(self):
         manager = PluginManager.__new__(PluginManager)
         manager.start_plugin = Mock(return_value=True)
@@ -256,7 +273,7 @@ class PluginLifecycleTests(unittest.TestCase):
     def test_worker_reports_debugger_wait_before_initialization(self):
         startup_phase = SimpleNamespace(value=int(PluginStartupPhase.NOT_STARTED))
         observed_phases = []
-        runtime_settings = object()
+        runtime_settings = SimpleNamespace(display_logs=True)
         logging_session = Mock()
         output_capture = Mock()
         worker = Mock()
@@ -331,7 +348,7 @@ class PluginLifecycleTests(unittest.TestCase):
                     {},
                     Mock(),
                     threading.Event(),
-                    runtime_settings=object(),
+                    runtime_settings=SimpleNamespace(display_logs=True),
                     startup_phase=startup_phase,
                 )
 
@@ -342,6 +359,7 @@ class PluginLifecycleTests(unittest.TestCase):
         process.is_alive.return_value = False
         process.pid = 1234
         manager = PluginManager.__new__(PluginManager)
+        manager._plugins_lock = threading.RLock()
         manager._plugins = {
             "test-plugin": PluginInfo(
                 plugin_id="test-plugin",

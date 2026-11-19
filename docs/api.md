@@ -8,7 +8,7 @@ transport machinery unless an application is building a custom integration.
 
 ### Class methods
 
-- `Descriptor(version, author, description=None, name=None, options=None, work_dir=None, log_dir=None, log_level=None, display_logs=None)`
+- `Descriptor(version, author, description=None, name=None, options=None, work_dir=None, log_dir=None, log_level=None, display_logs=None, write_logs=None)`
   returns a `PluginDescriptor`.
 - `default_options()` returns a dictionary of default plugin options.
 
@@ -120,6 +120,7 @@ Dataclass fields:
 | `log_dir` | Optional plugin log directory; relative paths resolve under the plugin's effective working directory |
 | `log_level` | Optional integer Python logging level; defaults to the manager's level |
 | `display_logs` | Optional console logging flag; defaults to the manager's setting |
+| `write_logs` | Optional file logging flag; defaults to the manager's setting |
 
 Serialization helpers are `to_dict()`, `to_json()`, `from_dict()`, and
 `from_json()`.
@@ -139,6 +140,7 @@ PluginManager(
     log_dir="logs",
     log_level=logging.INFO,
     display_logs=True,
+    write_logs=True,
     timeout_initialize=30.0,
     timeout_debugger_attach=None,
 )
@@ -154,6 +156,9 @@ The manager resolves `work_dir` to the current directory when omitted and
 resolves a relative `log_dir` under it. A unique run folder is created below
 the log directory. It contains `manager.log` and one log file per plugin.
 Descriptor values override the corresponding manager defaults for that plugin.
+Set `write_logs=False` to disable manager and plugin file handlers. Set
+`display_logs=False` separately to suppress worker and logger terminal output;
+captured worker `print()` calls may still be written to plugin files.
 File and console output use the effective log level; console output is enabled
 by default. The manager and plugins can independently change their process's
 formats with `set_log_formats(file_format=None, console_format=None)`.

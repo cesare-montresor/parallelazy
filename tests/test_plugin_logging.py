@@ -34,6 +34,59 @@ class _FlushRecordingStream(io.StringIO):
 
 
 class PluginLoggingTests(unittest.TestCase):
+    def test_display_logs_false_suppresses_worker_streams_but_still_captures_them(self):
+        log_file = os.path.join(tempfile.gettempdir(), f"hidden-stream-{id(self)}.log")
+        terminal_stdout = _FlushRecordingStream()
+        terminal_stderr = _FlushRecordingStream()
+        logger = logging.getLogger(f"logging-hidden-test.{id(self)}")
+        logger.handlers.clear()
+        logger.propagate = False
+
+        with patch("sys.stdout", terminal_stdout), patch("sys.stderr", terminal_stderr):
+            session = LoggingSession(
+                logger=logger,
+                log_file=log_file,
+                plugin_id="worker-1",
+                log_level=logging.INFO,
+                display_logs=False,
+            )
+            capture = configure_worker_output(logger, display_logs=False)
+            try:
+                print("hidden stdout")
+                print("hidden stderr", file=sys.stderr)
+            finally:
+                capture.close()
+                session.close()
+
+        self.assertEqual(terminal_stdout.getvalue(), "")
+        self.assertEqual(terminal_stderr.getvalue(), "")
+        with open(log_file, encoding="utf-8") as log_stream:
+            contents = log_stream.read()
+        self.assertIn("[stdout] hidden stdout", contents)
+        self.assertIn("[stderr] hidden stderr", contents)
+        os.remove(log_file)
+
+    def test_write_logs_false_creates_no_log_file(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            log_file = os.path.join(temporary_directory, "worker.log")
+            logger = logging.getLogger(f"logging-no-file-test.{id(self)}")
+            logger.handlers.clear()
+            logger.propagate = False
+            session = LoggingSession(
+                logger=logger,
+                log_file=log_file,
+                plugin_id="worker",
+                log_level=logging.INFO,
+                display_logs=False,
+                write_logs=False,
+            )
+            try:
+                logger.info("not written")
+            finally:
+                session.close()
+
+            self.assertFalse(os.path.exists(log_file))
+
     def test_worker_streams_are_logged_and_still_written_to_terminal(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             log_file = os.path.join(temporary_directory, "worker.log")

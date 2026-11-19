@@ -468,6 +468,7 @@ class RequestEnvUnsubscribe(Request):
 class RequestEnvUpdate(Request):
     command: CommandType = field(default=CommandType.ENV_UPDATE, init=False)
     name: str = None
+    value: Any = None
 
 ### Pub/Sub Requests
 

@@ -512,13 +512,13 @@ class PluginEnvRPC(PluginCoreRPC):
         except Exception as e:
             logger.error(f"Failed to unsubscribe from env variable '{var_name}': {e}")
 
-    def env_update(self, var_name: str) :
+    def env_update(self, var_name: str, value: Any = None) :
         """
             Update an environment variable.
 
         """
         try:
-            return self.request(RequestEnvUpdate(name=var_name))
+            return self.request(RequestEnvUpdate(name=var_name, value=value))
         except Exception as e:
             logger.error(f"Failed to notify update env variable '{var_name}': {e}")
 

@@ -18,7 +18,7 @@ import threading
 from multiprocessing.sharedctypes import Synchronized
 
 
-from parallelazy.utils import init_debugger, is_debugging_enabled, process_start_spawn, setup_worker_debugging_env
+from parallelazy.utils import init_debugger, is_debugging_enabled
 from parallelazy.plugin_data import  Channel, CommandType, PluginStartupPhase, ProcessStatus, Queue,QueueDescriptor, PendingRequest, PluginStatus,  RequestPluginErrors, RequestPluginStart, RequestPluginStatus, RequestPluginStop, RequestTopicList, Subscriber, Subscription
 from parallelazy.plugin import Plugin, PluginDescriptor, PluginState
 from parallelazy.plugin_logging import (
@@ -52,11 +52,6 @@ def _set_startup_phase(
 # ============================================================================
 # PLUGIN WORKER
 # ============================================================================
-
-process_start_spawn()
-
-
-
 
 class PluginWorker:
     """
@@ -101,7 +96,10 @@ class PluginWorker:
                 _set_startup_phase(startup_phase, PluginStartupPhase.WAITING_FOR_DEBUGGER)
                 init_debugger(plugin_id)
             _set_startup_phase(startup_phase, PluginStartupPhase.INITIALIZING)
-            output_capture = configure_worker_output(logging.getLogger())
+            output_capture = configure_worker_output(
+                logging.getLogger(),
+                display_logs=runtime_settings.display_logs,
+            )
 
             worker = PluginWorker(
                 plugin_id,
@@ -169,6 +167,7 @@ class PluginWorker:
         self.topic_published = set()
         self.topic_subscriptions: Dict[str, Subscription] = {}
         self.topic_subscribers: Dict[str, Dict[str,Subscriber]] = {}
+        self._topic_subscribers_lock = threading.RLock()
         # Topic subscriptions: topic_name -> queue
         self.env_subscriptions: Dict[str, Callable] = {}
         
@@ -556,7 +555,7 @@ class PluginWorker:
         return response.result
     
     def env_subscribe(self, var_name: str, callback: Callable) -> bool:
-        """Get all environment variables."""
+        """Subscribe to environment updates and invoke callback with the value."""
 
         pending: PendingRequest = self.rpc.env_subscribe(var_name)
         
@@ -569,8 +568,11 @@ class PluginWorker:
         
         self.env_subscriptions[var_name] = callback
 
-        
-        callback(var_name)  # Trigger callback for initial value
+        initial = self.rpc.env_get(var_name).wait()
+        if initial is not None and not initial.error:
+            callback(initial.result)
+        else:
+            callback(None)
 
         return True
     
@@ -667,10 +669,10 @@ class PluginWorker:
         # first time publishing this topic
         if topic in self.topic_published: return True
 
-        if not topic in self.topic_subscribers:
-            self.topic_subscribers[topic] = {}
-
-        topic_subscribers: dict[str, Subscriber] = self.topic_subscribers.get(topic)
+        with self._topic_subscribers_lock:
+            if topic not in self.topic_subscribers:
+                self.topic_subscribers[topic] = {}
+            topic_subscribers = self.topic_subscribers[topic]
         reponse = self.rpc.topic_announce(topic).wait()
         if reponse.error:
             logger.error(f"Error registering topic '{topic}': {reponse.error}")
@@ -690,7 +692,8 @@ class PluginWorker:
                 diff_subs.append(sub)
                 topic_subscribers[sub.plugin_id] = sub
 
-        topic_subscribers.update(manager_subscribers)
+        with self._topic_subscribers_lock:
+            topic_subscribers.update(manager_subscribers)
         #print("topic_announce: manager_subscribers: ", self.topic_published, manager_subscribers )
         
 
@@ -701,8 +704,11 @@ class PluginWorker:
 
         self.topic_announce(topic)
         
-        topic_subscribers = self.topic_subscribers.get(topic, None) 
-        if topic_subscribers is None: return
+        with self._topic_subscribers_lock:
+            topic_subscribers = dict(
+                self.topic_subscribers.get(topic, {})
+            )
+        if not topic_subscribers: return
             
 
         #print("topic_publish: topic_subscribers: ",self.topic_subscribers)
@@ -781,8 +787,10 @@ class PluginWorker:
     def _respond_env_update(self, rpc: PluginRPC, req: RequestEnvUpdate) -> None:
         """Receive environment variable change notification."""
         var_name = req.name
-        callback = self.env_subscriptions[var_name]
-        self._invoke_callback(callback, var_name)
+        callback = self.env_subscriptions.get(var_name)
+        if callback is None:
+            return True
+        self._invoke_callback(callback, req.value)
         return True
 
     def _invoke_callback(self, callback: Callable, *args) -> None:
@@ -805,7 +813,8 @@ class PluginWorker:
     def _topic_listener(self, topic: str) -> None:
         """Background thread: listen for messages from topic subscriptions. one thread each"""
         self.did_start.wait()  # Ensure plugin has started before processing messages
-        registered = self.topic_subscriptions.get(topic)
+        with getattr(self, "_topic_subscribers_lock", threading.RLock()):
+            registered = self.topic_subscriptions.get(topic)
         
         while True:
             
@@ -814,7 +823,8 @@ class PluginWorker:
                 break
 
             # check is subscription still active (in case unsubscribed while waiting for data)
-            cur = self.topic_subscriptions.get(topic,None)
+            with getattr(self, "_topic_subscribers_lock", threading.RLock()):
+                cur = self.topic_subscriptions.get(topic,None)
             if cur is None or cur != registered: 
                 logger.info(f"Subscription for topic '{topic}' no longer registered, stopping listener thread")
                 break
@@ -866,9 +876,10 @@ class PluginWorker:
         topic = sub.topic
         sub.queue = Queue(req.subscriber.queue_descriptor)
         
-        if topic not in self.topic_subscribers:
-            self.topic_subscribers[topic] = {}
-        self.topic_subscribers[topic][plugin_id] = sub
+        with self._topic_subscribers_lock:
+            if topic not in self.topic_subscribers:
+                self.topic_subscribers[topic] = {}
+            self.topic_subscribers[topic][plugin_id] = sub
 
         # logger.info('_respond: topic_subscribers: %s', self.topic_subscribers)
 
@@ -879,9 +890,10 @@ class PluginWorker:
         plugin_id = req.sender
         topic = req.subscriber.topic
 
-        if topic not in self.topic_subscribers: return True
-        if plugin_id not in self.topic_subscribers[topic]: return True
-        sub = self.topic_subscribers[topic].pop(plugin_id)
+        with self._topic_subscribers_lock:
+            if topic not in self.topic_subscribers: return True
+            if plugin_id not in self.topic_subscribers[topic]: return True
+            sub = self.topic_subscribers[topic].pop(plugin_id)
         
         try:
             sub.queue.close()

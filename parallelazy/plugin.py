@@ -64,6 +64,7 @@ class PluginDescriptor:
     log_dir: Optional[str] = None
     log_level: Optional[int] = None
     display_logs: Optional[bool] = None
+    write_logs: Optional[bool] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert descriptor to dictionary (JSON-serializable)."""
@@ -143,6 +144,7 @@ class Plugin:
         log_dir: Optional[str] = None,
         log_level: Optional[int] = None,
         display_logs: Optional[bool] = None,
+        write_logs: Optional[bool] = None,
     ) -> PluginDescriptor:
         all_options = cls.default_options().copy()
         all_options.update(options or {})
@@ -160,6 +162,7 @@ class Plugin:
             log_dir=log_dir,
             log_level=log_level,
             display_logs=display_logs,
+            write_logs=write_logs,
             
         )
 
