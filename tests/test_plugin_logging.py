@@ -241,6 +241,8 @@ class PluginLoggingTests(unittest.TestCase):
             try:
                 self.assertTrue(manager.load_plugin(descriptor))
                 self.assertTrue(manager.start_plugin(descriptor.name))
+                status = manager.plugin_status(descriptor.name)
+                self.assertEqual(status.startup_phase, "ready")
                 self.assertTrue(manager.stop_plugin(descriptor.name))
                 self.assertTrue(manager.unload_plugin(descriptor.name))
 

@@ -15,10 +15,11 @@ import logging
 import importlib
 from queue import Full
 import threading
+from multiprocessing.sharedctypes import Synchronized
 
 
 from parallelazy.utils import init_debugger, is_debugging_enabled, process_start_spawn, setup_worker_debugging_env
-from parallelazy.plugin_data import  Channel, CommandType, ProcessStatus, Queue,QueueDescriptor, PendingRequest, PluginStatus,  RequestPluginErrors, RequestPluginStart, RequestPluginStatus, RequestPluginStop, RequestTopicList, Subscriber, Subscription
+from parallelazy.plugin_data import  Channel, CommandType, PluginStartupPhase, ProcessStatus, Queue,QueueDescriptor, PendingRequest, PluginStatus,  RequestPluginErrors, RequestPluginStart, RequestPluginStatus, RequestPluginStop, RequestTopicList, Subscriber, Subscription
 from parallelazy.plugin import Plugin, PluginDescriptor, PluginState
 from parallelazy.plugin_logging import (
     LoggingSession,
@@ -38,6 +39,14 @@ from typing import Any, Callable, Dict,  Optional, TYPE_CHECKING
 
 
 logger = logging.getLogger(__name__)
+
+
+def _set_startup_phase(
+    startup_phase: Optional[Synchronized],
+    phase: PluginStartupPhase,
+) -> None:
+    if startup_phase is not None:
+        startup_phase.value = int(phase)
 
 
 # ============================================================================
@@ -68,6 +77,7 @@ class PluginWorker:
         queue_descriptor: QueueDescriptor,
         initialized: Event,
         runtime_settings: Optional[PluginRuntimeSettings] = None,
+        startup_phase: Optional[Synchronized] = None,
     ) -> None:
         """
         Entry point for plugin subprocess.
@@ -79,13 +89,18 @@ class PluginWorker:
             queue_descriptor: Queue descriptor for communication
             initialized: Event to signal initialization completion
             runtime_settings: Resolved paths and logging settings for this worker
+            startup_phase: Shared startup phase state for manager visibility
         """
-        runtime_settings = runtime_settings or default_runtime_settings()
-        logging_session = configure_worker_logging(runtime_settings, plugin_id)
+        _set_startup_phase(startup_phase, PluginStartupPhase.PROCESS_STARTED)
+        logging_session = None
         output_capture = None
         try:
+            runtime_settings = runtime_settings or default_runtime_settings()
+            logging_session = configure_worker_logging(runtime_settings, plugin_id)
             if is_debugging_enabled():
+                _set_startup_phase(startup_phase, PluginStartupPhase.WAITING_FOR_DEBUGGER)
                 init_debugger(plugin_id)
+            _set_startup_phase(startup_phase, PluginStartupPhase.INITIALIZING)
             output_capture = configure_worker_output(logging.getLogger())
 
             worker = PluginWorker(
@@ -96,12 +111,21 @@ class PluginWorker:
                 initialized,
                 runtime_settings=runtime_settings,
                 logging_session=logging_session,
+                startup_phase=startup_phase,
             )
             worker.main()
+        except Exception:
+            if (
+                startup_phase is not None
+                and startup_phase.value < PluginStartupPhase.READY
+            ):
+                _set_startup_phase(startup_phase, PluginStartupPhase.FAILED)
+            raise
         finally:
             if output_capture is not None:
                 output_capture.close()
-            logging_session.close()
+            if logging_session is not None:
+                logging_session.close()
     
     def __init__(
         self,
@@ -112,6 +136,7 @@ class PluginWorker:
         initialized: Event,
         runtime_settings: Optional[PluginRuntimeSettings] = None,
         logging_session: Optional[LoggingSession] = None,
+        startup_phase: Optional[Synchronized] = None,
     ):
         """Initialize worker."""
 
@@ -127,6 +152,7 @@ class PluginWorker:
         self.log_dir = runtime_settings.log_dir
         self._is_running = False
         self._initialized: Event = initialized
+        self._startup_phase = startup_phase
         self._logging = logging_session
         self._owns_logging = owns_logging
         
@@ -190,6 +216,7 @@ class PluginWorker:
 
         self.main_thread = threading.current_thread()
         self._is_running = True
+        _set_startup_phase(self._startup_phase, PluginStartupPhase.READY)
         self._initialized.set()  # Signal to manager that initialization is complete
         try:
             with self._lifecycle:
