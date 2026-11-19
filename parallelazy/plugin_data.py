@@ -21,9 +21,21 @@ import logging
 from concurrent.futures import Future
 from torch import multiprocessing as mp
 from dataclasses import dataclass, field, fields
+from enum import IntEnum
 from multiprocessing.connection import Connection
 
 import threading
+
+
+class PluginStartupPhase(IntEnum):
+    """Startup milestones reported by a plugin worker process."""
+
+    NOT_STARTED = 0
+    PROCESS_STARTED = 1
+    WAITING_FOR_DEBUGGER = 2
+    INITIALIZING = 3
+    READY = 4
+    FAILED = 5
 
 
 
@@ -344,11 +356,12 @@ class PluginStatus:
 
 @dataclass
 class ProcessStatus:
-    """Status of a plugin from manager perspective."""
+    """Manager-side process state, including the worker's startup phase."""
     plugin_id: str
     process_alive: bool
     process_pid: Optional[int]
     worker_status: Optional[PluginStatus] = None
+    startup_phase: Optional[str] = None
 
 
 
@@ -455,6 +468,7 @@ class RequestEnvUnsubscribe(Request):
 class RequestEnvUpdate(Request):
     command: CommandType = field(default=CommandType.ENV_UPDATE, init=False)
     name: str = None
+    value: Any = None
 
 ### Pub/Sub Requests
 

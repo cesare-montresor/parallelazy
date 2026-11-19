@@ -168,7 +168,10 @@ or may reject input.
 
 The manager provides `plugin_status(plugin_id)`,
 `plugin_status_all()`, and `plugin_list()`. A status includes process
-identity/aliveness and the worker-reported status when available.
+identity/aliveness, the worker-reported status when available, and the
+worker's startup phase. The phase distinguishes debugger attachment from
+worker initialization; a worker waiting for a debugger is reported as
+`waiting_for_debugger`.
 
 Use manager logs and plugin-specific logging for diagnostics. A worker records
 exceptions raised by its loop in its error log; the lifecycle and RPC methods

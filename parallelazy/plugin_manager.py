@@ -7,13 +7,17 @@ Uses simplified request/response protocol via Channel.
 
 from dataclasses import dataclass
 import logging
+import math
 import os
 import threading
 import torch.multiprocessing as mp
 import time
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue as WorkQueue
+from multiprocessing.sharedctypes import Synchronized
 from typing import Any, Dict, List, Optional
 
-from parallelazy.utils import is_debugpy_attached, process_start_spawn
+from parallelazy.utils import is_debugpy_attached, process_start_spawn, setup_worker_debugging_env
 from parallelazy.plugin import PluginDescriptor
 from parallelazy.plugin_logging import (
     PluginRuntimeSettings,
@@ -22,13 +26,10 @@ from parallelazy.plugin_logging import (
     resolve_directory,
 )
 from parallelazy.plugin_rpc import PluginRPC, RequestEnvGetAll, RequestEnvUnsubscribe, RequestTopicAnnounce
-from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicSubscribe, RequestTopicUnsubscribe, setup_worker_debugging_env
-from parallelazy.plugin_data import  CommandType, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, Subscriber
+from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicSubscribe, RequestTopicUnsubscribe
+from parallelazy.plugin_data import  CommandType, PluginStartupPhase, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, Subscriber
 from parallelazy.environment_manager import EnvironmentManager
 
-
-process_start_spawn()
-    
 
 @dataclass
 class PluginInfo:
@@ -38,6 +39,7 @@ class PluginInfo:
     descriptor: PluginDescriptor
     options: Dict[str, Any]
     stop_confirmed: bool = False
+    startup_phase: Optional[Synchronized] = None
 
 class PluginManager:
     """
@@ -59,6 +61,9 @@ class PluginManager:
         log_dir: str = "logs",
         log_level: int = logging.INFO,
         display_logs: bool = True,
+        timeout_initialize: float = 30.0,
+        timeout_debugger_attach: Optional[float] = None,
+        write_logs: bool = True,
     ):
         """
         Initialize plugin manager.
@@ -67,6 +72,9 @@ class PluginManager:
             timeout_request: Default timeout for sync requests (seconds)
             timeout_start: Timeout for start command (seconds)
             timeout_start_debug: Timeout for start command in debug mode (seconds)
+            timeout_initialize: Timeout for worker initialization (seconds)
+            timeout_debugger_attach: Optional timeout for debugger attachment
+            write_logs: Whether to write manager and plugin log files
             work_dir: Base working directory for the manager and plugins
             log_dir: Log directory, relative to work_dir unless absolute
             log_level: Default logging level for the manager and plugins
@@ -74,8 +82,27 @@ class PluginManager:
         """
         if not isinstance(display_logs, bool):
             raise TypeError("display_logs must be a bool")
+        if not isinstance(write_logs, bool):
+            raise TypeError("write_logs must be a bool")
         if isinstance(log_level, bool) or not isinstance(log_level, int):
             raise TypeError("log_level must be an integer logging level")
+        if (
+            isinstance(timeout_initialize, bool)
+            or not isinstance(timeout_initialize, (int, float))
+        ):
+            raise TypeError("timeout_initialize must be a number")
+        if not math.isfinite(timeout_initialize) or timeout_initialize <= 0:
+            raise ValueError("timeout_initialize must be finite and greater than zero")
+        if timeout_debugger_attach is not None:
+            if (
+                isinstance(timeout_debugger_attach, bool)
+                or not isinstance(timeout_debugger_attach, (int, float))
+            ):
+                raise TypeError("timeout_debugger_attach must be a number or None")
+            if not math.isfinite(timeout_debugger_attach) or timeout_debugger_attach <= 0:
+                raise ValueError(
+                    "timeout_debugger_attach must be finite and greater than zero"
+                )
 
         self._work_dir = resolve_directory(work_dir or os.getcwd())
         self._log_dir_setting = log_dir
@@ -92,11 +119,14 @@ class PluginManager:
             log_level,
             display_logs,
             self.run_id,
+            write_logs,
         )
         self.logger = self._logging.logger
 
+        process_start_spawn()
+
         self._plugins: Dict[str, PluginInfo] = {}  # plugin_id -> PluginInfo
-        self._plugins_lock = threading.Lock()  # For thread-safe plugin management
+        self._plugins_lock = threading.RLock()  # For nested registry operations
         self._loading_plugins = set()
 
         self._topic_publishers: Dict[str, str] = {}       # topic -> plugin_id
@@ -110,6 +140,17 @@ class PluginManager:
         self.timeout_request = timeout_request
         self.worker_pydebug = is_debugpy_attached()
         self.timeout_start = timeout_start if not self.worker_pydebug else timeout_start_debug
+        self.timeout_initialize = timeout_initialize
+        self.timeout_debugger_attach = timeout_debugger_attach
+        self.write_logs = write_logs
+        self._env_update_queue: WorkQueue = WorkQueue()
+        self._env_dispatcher_stop = object()
+        self._env_dispatcher = threading.Thread(
+            target=self._dispatch_environment_updates,
+            name="plugin-env-dispatcher",
+            daemon=True,
+        )
+        self._env_dispatcher.start()
 
 
         if self.worker_pydebug:
@@ -179,6 +220,8 @@ class PluginManager:
             or not isinstance(descriptor.log_level, int)
         ):
             raise TypeError("descriptor.log_level must be an integer logging level or None")
+        if descriptor.write_logs is not None and not isinstance(descriptor.write_logs, bool):
+            raise TypeError("descriptor.write_logs must be a bool or None")
 
         work_dir = (
             self.work_dir
@@ -204,10 +247,19 @@ class PluginManager:
                 if descriptor.display_logs is None
                 else descriptor.display_logs
             ),
+            write_logs=(
+                self.write_logs
+                if descriptor.write_logs is None
+                else descriptor.write_logs
+            ),
         )
 
 
-    def load_plugins(self, descriptors: List[PluginDescriptor], parallel: bool = True) -> None:
+    def load_plugins(
+        self,
+        descriptors: List[PluginDescriptor],
+        parallel: bool = True,
+    ) -> Dict[str, bool]:
 
         """
         Load and initialize multiple plugins.
@@ -215,28 +267,107 @@ class PluginManager:
         Args:
             descriptors: List of PluginDescriptor objects
             parallel: Whether to load plugins in parallel
+
+        Returns:
+            Mapping of plugin IDs to whether each plugin loaded successfully.
         """
 
         if parallel:
-            barrier = mp.Barrier(len(descriptors) + 1)  # +1 for the main process
-            for descriptor in descriptors:
-                thread = threading.Thread(target=self._load_plugin_thread, args=(descriptor, barrier))
-                thread.start()
-            barrier.wait()  # Wait for all plugins to be loaded
-        else:
-            for descriptor in descriptors:
-                self.load_plugin(descriptor)
+            with ThreadPoolExecutor(
+                max_workers=max(1, len(descriptors)),
+                thread_name_prefix="plugin-load",
+            ) as executor:
+                futures = [
+                    (descriptor.name, executor.submit(self.load_plugin, descriptor))
+                    for descriptor in descriptors
+                ]
+                return {
+                    plugin_id: future.result()
+                    for plugin_id, future in futures
+                }
+        return {
+            descriptor.name: self.load_plugin(descriptor)
+            for descriptor in descriptors
+        }
 
-    def _load_plugin_thread(self, descriptor: PluginDescriptor, barrier: 'mp.Barrier') -> None:
-        """
-        Thread target for loading a plugin and waiting at the barrier.
-        
-        Args:
-            descriptor: PluginDescriptor object
-            barrier: Multiprocessing barrier for synchronization
-        """
-        self.load_plugin(descriptor)
-        barrier.wait()  # Wait for all plugins to be loaded
+    def _wait_for_worker_ready(
+        self,
+        plugin_id: str,
+        process: mp.Process,
+        initialized: Any,
+        startup_phase: Synchronized,
+    ) -> bool:
+        deadline = None
+        last_phase = None
+        log_interval = max(self.timeout_start, 0.1)
+        next_status_log = time.monotonic() + log_interval
+
+        while process.is_alive():
+            if initialized.is_set():
+                return True
+
+            phase = PluginStartupPhase(startup_phase.value)
+            now = time.monotonic()
+            if phase is not last_phase:
+                last_phase = phase
+                if phase is PluginStartupPhase.WAITING_FOR_DEBUGGER:
+                    deadline = (
+                        None
+                        if self.timeout_debugger_attach is None
+                        else now + self.timeout_debugger_attach
+                    )
+                elif phase is PluginStartupPhase.READY:
+                    deadline = None
+                elif phase is PluginStartupPhase.FAILED:
+                    self.logger.error(
+                        "Plugin %s failed during startup",
+                        plugin_id,
+                    )
+                    return False
+                else:
+                    deadline = now + self.timeout_initialize
+
+            if deadline is not None and now >= deadline:
+                if initialized.is_set():
+                    return True
+                current_phase = PluginStartupPhase(startup_phase.value)
+                if current_phase is not phase:
+                    continue
+                timeout = self.timeout_initialize
+                if (
+                    phase is PluginStartupPhase.WAITING_FOR_DEBUGGER
+                    and self.timeout_debugger_attach is not None
+                ):
+                    timeout = self.timeout_debugger_attach
+                self.logger.error(
+                    "Plugin %s timed out during startup phase %s after %.1f seconds",
+                    plugin_id,
+                    phase.name.lower(),
+                    timeout,
+                )
+                startup_phase.value = int(PluginStartupPhase.FAILED)
+                return False
+
+            if now >= next_status_log:
+                if phase is PluginStartupPhase.WAITING_FOR_DEBUGGER:
+                    self.logger.info(
+                        "Plugin %s is waiting for debugger attachment",
+                        plugin_id,
+                    )
+                else:
+                    self.logger.info(
+                        "Plugin %s is still initializing (phase=%s)",
+                        plugin_id,
+                        phase.name.lower(),
+                    )
+                next_status_log = now + log_interval
+
+            wait_timeout = 0.1
+            if deadline is not None:
+                wait_timeout = min(wait_timeout, max(0.0, deadline - now))
+            initialized.wait(timeout=wait_timeout)
+
+        return initialized.is_set()
 
     def load_plugin(
         self,
@@ -273,6 +404,7 @@ class PluginManager:
             worker_channel = plugin_rpc.channel.remote_descriptor()  # For worker to manager communication
             initialized = mp.Event()
             initialized.clear()  # Ensure not set
+            startup_phase = mp.Value("i", PluginStartupPhase.NOT_STARTED)
 
             # Spawn worker process
             process = mp.Process(
@@ -284,6 +416,7 @@ class PluginManager:
                     worker_channel,
                     initialized,
                     runtime_settings,
+                    startup_phase,
                 ),
                 name=f"plugin-{plugin_id}"
             )
@@ -294,22 +427,28 @@ class PluginManager:
                 process=process,
                 rpc=plugin_rpc,
                 descriptor=descriptor,
-                options=options
+                options=options,
+                startup_phase=startup_phase,
             )
             with self._plugins_lock:
                 self._plugins[plugin_id] = plugin_info
             
             process.start()
-            is_ready = False
-            while process.is_alive():
-                is_ready = initialized.wait(timeout=self.timeout_start)
-                if is_ready: break
-                # If we get here, wait() timed out but the process is still alive
-                self.logger.info(f"Plugin {plugin_id} is still initializing (waiting...)")
+            is_ready = self._wait_for_worker_ready(
+                plugin_id,
+                process,
+                initialized,
+                startup_phase,
+            )
 
             # If the loop exited and is_ready is False, the process died before setting the event
             if not is_ready:
-                self.logger.error(f"Plugin {plugin_id} failed to initialize (process terminated unexpectedly).")
+                phase = PluginStartupPhase(startup_phase.value)
+                self.logger.error(
+                    "Plugin %s did not become ready (last phase=%s)",
+                    plugin_id,
+                    phase.name.lower(),
+                )
                 return False
 
             self.logger.info(f"Plugin {plugin_id} loaded")
@@ -367,31 +506,38 @@ class PluginManager:
             self.logger.error(f"Error starting plugin {plugin_id}: {e}")
             return False
 
-    def start_plugins(self, plugin_ids: List[str], parallel: bool = True) -> None:
+    def start_plugins(
+        self,
+        plugin_ids: List[str],
+        parallel: bool = True,
+    ) -> Dict[str, bool]:
         """
         Start multiple loaded plugins.
 
         Args:
             plugin_ids: Identifiers of the plugins to start
             parallel: Whether to start plugins in parallel
+
+        Returns:
+            Mapping of plugin IDs to whether each plugin started successfully.
         """
         if parallel:
-            barrier = mp.Barrier(len(plugin_ids) + 1)
-            for plugin_id in plugin_ids:
-                thread = threading.Thread(
-                    target=self._start_plugin_thread,
-                    args=(plugin_id, barrier),
-                )
-                thread.start()
-            barrier.wait()
-        else:
-            for plugin_id in plugin_ids:
-                self.start_plugin(plugin_id)
-
-    def _start_plugin_thread(self, plugin_id: str, barrier: 'mp.Barrier') -> None:
-        """Start a plugin in a thread and wait for the other starts to finish."""
-        self.start_plugin(plugin_id)
-        barrier.wait()
+            with ThreadPoolExecutor(
+                max_workers=max(1, len(plugin_ids)),
+                thread_name_prefix="plugin-start",
+            ) as executor:
+                futures = [
+                    (plugin_id, executor.submit(self.start_plugin, plugin_id))
+                    for plugin_id in plugin_ids
+                ]
+                return {
+                    plugin_id: future.result()
+                    for plugin_id, future in futures
+                }
+        return {
+            plugin_id: self.start_plugin(plugin_id)
+            for plugin_id in plugin_ids
+        }
         
     
     def stop_plugin(self, plugin_id: str) -> bool:
@@ -475,29 +621,33 @@ class PluginManager:
             return False
 
     def _cleanup_plugin_registrations(self, plugin_id: str) -> None:
-        for env, plugins in list(self._env_subscribers.items()):
-            if plugin_id in plugins:
-                plugins.remove(plugin_id)
-            if not plugins:
-                del self._env_subscribers[env]
+        with self._plugins_lock:
+            for env, plugins in list(self._env_subscribers.items()):
+                if plugin_id in plugins:
+                    plugins.remove(plugin_id)
+                if not plugins:
+                    del self._env_subscribers[env]
 
-        for topic, plugins in list(self._topic_subscribers.items()):
-            plugins.pop(plugin_id, None)
-            if not plugins:
-                del self._topic_subscribers[topic]
+            for topic, plugins in list(self._topic_subscribers.items()):
+                plugins.pop(plugin_id, None)
+                if not plugins:
+                    del self._topic_subscribers[topic]
 
-        for topic, publisher in list(self._topic_publishers.items()):
-            if publisher == plugin_id:
-                del self._topic_publishers[topic]
+            for topic, publisher in list(self._topic_publishers.items()):
+                if publisher == plugin_id:
+                    del self._topic_publishers[topic]
         
-    def start_all_plugins(self, parallel=True) -> None:
-        """Start all loaded plugins."""
-        ids = list(self._plugins.keys())
-        self.start_plugins(ids, parallel=parallel)
+    def start_all_plugins(self, parallel=True) -> Dict[str, bool]:
+        """Start all loaded plugins and return each plugin's result."""
+        with self._plugins_lock:
+            ids = list(self._plugins.keys())
+        return self.start_plugins(ids, parallel=parallel)
     
     def stop_all_plugins(self) -> None:
         """Stop all running plugins."""
-        for plugin_id in list(self._plugins.keys()):
+        with self._plugins_lock:
+            plugin_ids = list(self._plugins.keys())
+        for plugin_id in plugin_ids:
             self.stop_plugin(plugin_id)
 
     
@@ -505,8 +655,11 @@ class PluginManager:
         """Shut down the plugin manager and all plugins."""
         self.disable_monitoring()
         self.stop_all_plugins()
-        for plugin_id in list(self._plugins.keys()):
+        with self._plugins_lock:
+            plugin_ids = list(self._plugins.keys())
+        for plugin_id in plugin_ids:
             self.unload_plugin(plugin_id)
+        self.shutdown_env_dispatcher()
 
     # ========================================================================
     # Utility Methods for Plugin Management
@@ -524,10 +677,10 @@ class PluginManager:
         Returns:
             ProcessStatus object, or None if not found
         """
-        if plugin_id not in self._plugins:
+        with self._plugins_lock:
+            info = self._plugins.get(plugin_id)
+        if info is None:
             return None
-        
-        info = self._plugins[plugin_id]
         process = info.process
         alive = process.is_alive()
         pid = process.pid
@@ -550,7 +703,12 @@ class PluginManager:
             plugin_id=plugin_id,
             process_alive=alive,
             process_pid=pid,
-            worker_status=worker_status
+            worker_status=worker_status,
+            startup_phase=(
+                PluginStartupPhase(info.startup_phase.value).name.lower()
+                if info.startup_phase is not None
+                else None
+            ),
         )
     
     def plugin_status_all(self) -> Dict[str, ProcessStatus]:
@@ -560,14 +718,17 @@ class PluginManager:
         Returns:
             Dictionary of plugin_id -> ProcessStatus
         """
+        with self._plugins_lock:
+            plugin_ids = tuple(self._plugins.keys())
         return {
             plugin_id: self.plugin_status(plugin_id)
-            for plugin_id in self._plugins.keys()
+            for plugin_id in plugin_ids
         }
     
     def plugin_list(self) -> List[str]:
         """List all loaded plugin IDs."""
-        return list(self._plugins.keys())
+        with self._plugins_lock:
+            return list(self._plugins.keys())
 
     def enable_monitoring(
         self,
@@ -664,16 +825,39 @@ class PluginManager:
 
     def env_set(self, name:str, value:Any) -> None:
         self._env.set(name, value)
-        threading.Thread(target=self._notify_env_update, args=(name,), daemon=True).start()
+        self._env_update_queue.put((name, value))
         return True
 
-    def _notify_env_update(self, name:str) -> None:
-        # Notify subscribed plugins
-        if name in self._env_subscribers:
-            for plugin_id in self._env_subscribers[name]:
-                if plugin_id in self._plugins:
-                    rpc = self._plugins[plugin_id].rpc
-                    rpc.env_update(name)
+    def _dispatch_environment_updates(self) -> None:
+        while True:
+            update = self._env_update_queue.get()
+            if update is self._env_dispatcher_stop:
+                return
+            name, value = update
+            self._notify_env_update(name, value)
+
+    def shutdown_env_dispatcher(self) -> None:
+        self._env_update_queue.put(self._env_dispatcher_stop)
+        self._env_dispatcher.join(timeout=1.0)
+
+    def _notify_env_update(self, name:str, value:Any=None) -> None:
+        with self._plugins_lock:
+            subscriber_ids = tuple(self._env_subscribers.get(name, ()))
+            rpc_by_plugin = {
+                plugin_id: self._plugins[plugin_id].rpc
+                for plugin_id in subscriber_ids
+                if plugin_id in self._plugins
+            }
+        for plugin_id, rpc in rpc_by_plugin.items():
+            try:
+                rpc.env_update(name, value)
+            except Exception as e:
+                self.logger.debug(
+                    "Failed to notify plugin %s about environment variable %s: %s",
+                    plugin_id,
+                    name,
+                    e,
+                )
 
     def env_get(self, name:str=None, default:Any=None) -> Any:
         if name is None:
@@ -682,25 +866,27 @@ class PluginManager:
     
 
     def env_subscribe(self, plugin_id: str, var_name: str) -> bool:
-        if plugin_id not in self._plugins:
-            return False
+        with self._plugins_lock:
+            if plugin_id not in self._plugins:
+                return False
 
-        if var_name not in self._env_subscribers:
-            self._env_subscribers[var_name] = []
+            if var_name not in self._env_subscribers:
+                self._env_subscribers[var_name] = []
 
-        if plugin_id not in self._env_subscribers[var_name]:
-            self._env_subscribers[var_name].append(plugin_id)
+            if plugin_id not in self._env_subscribers[var_name]:
+                self._env_subscribers[var_name].append(plugin_id)
 
         return True
 
     def env_unsubscribe(self, plugin_id: str, var_name: str) -> bool:   
-        if plugin_id not in self._plugins:
-            return False
+        with self._plugins_lock:
+            if plugin_id not in self._plugins:
+                return False
 
-        if var_name in self._env_subscribers and plugin_id in self._env_subscribers[var_name]:
-            self._env_subscribers[var_name].remove(plugin_id)
-            if not self._env_subscribers[var_name]:
-                del self._env_subscribers[var_name]
+            if var_name in self._env_subscribers and plugin_id in self._env_subscribers[var_name]:
+                self._env_subscribers[var_name].remove(plugin_id)
+                if not self._env_subscribers[var_name]:
+                    del self._env_subscribers[var_name]
         return True
     
     # ========================================================================
@@ -719,9 +905,10 @@ class PluginManager:
             Number of subscribers that received the message
         """
         
-        if topic not in self._topic_subscribers: return True
-    
-        for subscriber in self._topic_subscribers[topic].values():
+        with self._plugins_lock:
+            subscribers = tuple(self._topic_subscribers.get(topic, {}).values())
+
+        for subscriber in subscribers:
             try:
                 subscriber.queue.put_nowait(data)
             except Exception as e:
@@ -730,7 +917,8 @@ class PluginManager:
         return True
 
     def topic_list(self) -> List[str]:
-        return list(self._topic_subscribers.keys())
+        with self._plugins_lock:
+            return list(self._topic_subscribers.keys())
 
     # ========================================================================
     # PLUGIN Lifecycle
@@ -877,16 +1065,17 @@ class PluginManager:
         topic = sub.topic
         plugin_sub = req.sender
 
-        if plugin_sub not in self._plugins: return False
+        with self._plugins_lock:
+            if plugin_sub not in self._plugins: return False
 
-        plugin_pub = self._topic_publishers.get(topic,None)
-        if plugin_pub is not None and plugin_pub not in self._plugins: return False
+            plugin_pub = self._topic_publishers.get(topic,None)
+            if plugin_pub is not None and plugin_pub not in self._plugins: return False
 
-        if topic not in self._topic_subscribers:
-            self._topic_subscribers[topic] = {}
+            if topic not in self._topic_subscribers:
+                self._topic_subscribers[topic] = {}
 
-        if plugin_sub not in self._topic_subscribers[topic]:
-            self._topic_subscribers[topic][plugin_sub] = sub
+            if plugin_sub not in self._topic_subscribers[topic]:
+                self._topic_subscribers[topic][plugin_sub] = sub
 
         remote_result = True  # Default to success
 
@@ -895,7 +1084,14 @@ class PluginManager:
             remote_result = forward_rpc.forward(req)
             self.logger.debug(f"topic_subscribe: {remote_result}" )
 
-        if not remote_result: return False
+        if not remote_result:
+            with self._plugins_lock:
+                subscribers = self._topic_subscribers.get(topic)
+                if subscribers is not None:
+                    subscribers.pop(plugin_sub, None)
+                    if not subscribers:
+                        del self._topic_subscribers[topic]
+            return False
 
 
         
@@ -917,10 +1113,11 @@ class PluginManager:
         topic = sub.topic
         src_id = sub.plugin_id
 
-        if src_id not in self._plugins: return False
-        if topic not in self._topic_publishers: return False
+        with self._plugins_lock:
+            if src_id not in self._plugins: return False
+            if topic not in self._topic_publishers: return True
 
-        dst_id = self._topic_publishers[topic]
+            dst_id = self._topic_publishers[topic]
 
         forward_rpc = self._plugins[dst_id].rpc
         remote_result = forward_rpc.forward(req)
@@ -928,10 +1125,12 @@ class PluginManager:
         if not remote_result: return False
         
 
-        if src_id in self._topic_subscribers[topic]:
-            del self._topic_subscribers[topic][src_id]
-            if not self._topic_subscribers[topic]:
-                del self._topic_subscribers[topic]
+        with self._plugins_lock:
+            subscribers = self._topic_subscribers.get(topic)
+            if subscribers is not None:
+                subscribers.pop(src_id, None)
+                if not subscribers:
+                    del self._topic_subscribers[topic]
 
 
         return True
@@ -941,13 +1140,12 @@ class PluginManager:
         Announce a new topic.
         
         """
-        self._topic_publishers[req.topic] = req.sender
+        with self._plugins_lock:
+            self._topic_publishers[req.topic] = req.sender
 
-        if req.topic not in self._topic_subscribers:
-            self._topic_subscribers[req.topic] = {}
-        subs = self._topic_subscribers[req.topic]
-
-        return subs
+            if req.topic not in self._topic_subscribers:
+                self._topic_subscribers[req.topic] = {}
+            return dict(self._topic_subscribers[req.topic])
 
     def _respond_topic_list(self) -> List[str]:
         return self.topic_list()

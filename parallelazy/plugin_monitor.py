@@ -1,7 +1,6 @@
 """Read-only pipeline monitoring for PluginManager."""
 
 from dataclasses import dataclass
-import fcntl
 import os
 import struct
 import sys
@@ -302,6 +301,7 @@ class PipelineMonitor:
 
     def _read_pipe_pending_bytes(self, subscriber: Any) -> Optional[int]:
         try:
+            import fcntl
             descriptor = subscriber.queue_descriptor
             connection = descriptor.receive
             if connection.closed:

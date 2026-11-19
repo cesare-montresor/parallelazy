@@ -1,11 +1,12 @@
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from parallelazy.plugin import PluginState
 from parallelazy.plugin_data import Channel, CommandType, PluginStatus, ProcessStatus, RequestPluginStop
-from parallelazy.plugin_manager import PluginManager
+from parallelazy.plugin_data import PluginStartupPhase
+from parallelazy.plugin_manager import PluginInfo, PluginManager
 from parallelazy.plugin_rpc import PluginRPC
 from parallelazy.plugin_worker import PluginWorker
 
@@ -74,6 +75,9 @@ def _make_worker(plugin):
     worker.main_thread = None
     worker._is_running = False
     worker._initialized = threading.Event()
+    worker._startup_phase = SimpleNamespace(
+        value=int(PluginStartupPhase.INITIALIZING)
+    )
     worker.did_start = threading.Event()
     worker.did_stop = threading.Event()
     worker._stop_requested = threading.Event()
@@ -87,12 +91,30 @@ def _make_worker(plugin):
 
 
 class PluginLifecycleTests(unittest.TestCase):
+    def test_environment_update_callback_receives_value_not_name(self):
+        callback_values = []
+        worker = _make_worker(None)
+        worker.env_subscriptions = {
+            "config.batch_size": callback_values.append,
+        }
+
+        request = SimpleNamespace(
+            name="config.batch_size",
+            value=64,
+        )
+
+        result = worker._respond_env_update(Mock(), request)
+
+        self.assertTrue(result)
+        self.assertEqual(callback_values, [64])
+
     def test_start_plugins_sequentially(self):
         manager = PluginManager.__new__(PluginManager)
         manager.start_plugin = Mock(return_value=True)
 
-        manager.start_plugins(["first", "second"], parallel=False)
+        results = manager.start_plugins(["first", "second"], parallel=False)
 
+        self.assertEqual(results, {"first": True, "second": True})
         self.assertEqual(
             [args[0] for args, _ in manager.start_plugin.call_args_list],
             ["first", "second"],
@@ -100,16 +122,118 @@ class PluginLifecycleTests(unittest.TestCase):
 
     def test_start_plugins_in_parallel(self):
         manager = PluginManager.__new__(PluginManager)
-        start_barrier = threading.Barrier(3)
+        start_barrier = threading.Barrier(2)
 
         def start_plugin(plugin_id):
             start_barrier.wait(timeout=2)
-            return True
+            return plugin_id == "first"
 
         manager.start_plugin = Mock(side_effect=start_plugin)
-        manager.start_plugins(["first", "second"], parallel=True)
+        results = manager.start_plugins(["first", "second"], parallel=True)
 
+        self.assertEqual(results, {"first": True, "second": False})
         self.assertEqual(manager.start_plugin.call_count, 2)
+
+    def test_load_plugins_in_parallel_returns_each_result(self):
+        manager = PluginManager.__new__(PluginManager)
+        load_barrier = threading.Barrier(2)
+
+        def load_plugin(descriptor):
+            load_barrier.wait(timeout=2)
+            return descriptor.name == "first"
+
+        manager.load_plugin = Mock(side_effect=load_plugin)
+        descriptors = [
+            SimpleNamespace(name="first"),
+            SimpleNamespace(name="second"),
+        ]
+
+        results = manager.load_plugins(descriptors, parallel=True)
+
+        self.assertEqual(results, {"first": True, "second": False})
+        self.assertEqual(manager.load_plugin.call_count, 2)
+
+    def test_worker_initialization_deadline_excludes_debugger_wait(self):
+        manager = PluginManager.__new__(PluginManager)
+        manager.timeout_initialize = 0.02
+        manager.timeout_debugger_attach = None
+        manager.timeout_start = 1.0
+        manager.logger = Mock()
+        startup_phase = SimpleNamespace(
+            value=int(PluginStartupPhase.WAITING_FOR_DEBUGGER)
+        )
+        initialized = threading.Event()
+        process = Mock()
+        process.is_alive.return_value = True
+        result = []
+
+        def finish_debugger_wait():
+            threading.Event().wait(0.06)
+            startup_phase.value = int(PluginStartupPhase.INITIALIZING)
+            initialized.set()
+
+        release_thread = threading.Thread(target=finish_debugger_wait)
+        release_thread.start()
+        result.append(
+            manager._wait_for_worker_ready(
+                "test-plugin",
+                process,
+                initialized,
+                startup_phase,
+            )
+        )
+        release_thread.join(timeout=1)
+
+        self.assertEqual(result, [True])
+        self.assertEqual(startup_phase.value, PluginStartupPhase.INITIALIZING)
+
+    def test_debugger_attach_deadline_is_configurable(self):
+        manager = PluginManager.__new__(PluginManager)
+        manager.timeout_initialize = 1.0
+        manager.timeout_debugger_attach = 0.02
+        manager.timeout_start = 1.0
+        manager.logger = Mock()
+        startup_phase = SimpleNamespace(
+            value=int(PluginStartupPhase.WAITING_FOR_DEBUGGER)
+        )
+        initialized = threading.Event()
+        process = Mock()
+        process.is_alive.return_value = True
+
+        result = manager._wait_for_worker_ready(
+            "test-plugin",
+            process,
+            initialized,
+            startup_phase,
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(startup_phase.value, PluginStartupPhase.FAILED)
+        manager.logger.error.assert_called_once()
+
+    def test_initialization_deadline_marks_worker_failed(self):
+        manager = PluginManager.__new__(PluginManager)
+        manager.timeout_initialize = 0.02
+        manager.timeout_debugger_attach = None
+        manager.timeout_start = 1.0
+        manager.logger = Mock()
+        startup_phase = SimpleNamespace(
+            value=int(PluginStartupPhase.INITIALIZING)
+        )
+        initialized = threading.Event()
+        process = Mock()
+        process.is_alive.return_value = True
+
+        result = manager._wait_for_worker_ready(
+            "test-plugin",
+            process,
+            initialized,
+            startup_phase,
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(startup_phase.value, PluginStartupPhase.FAILED)
+        manager.logger.error.assert_called_once()
 
     def test_topic_callback_error_log_identifies_topic_without_repeating_plugin_id(self):
         plugin = _RaisingCallbackPlugin()
@@ -146,6 +270,113 @@ class PluginLifecycleTests(unittest.TestCase):
         self.assertNotIn("test-plugin", logs.output[0])
         self.assertIn("No such file or directory", logs.output[0])
 
+    def test_worker_reports_debugger_wait_before_initialization(self):
+        startup_phase = SimpleNamespace(value=int(PluginStartupPhase.NOT_STARTED))
+        observed_phases = []
+        runtime_settings = SimpleNamespace(display_logs=True)
+        logging_session = Mock()
+        output_capture = Mock()
+        worker = Mock()
+
+        def init_debugger(_plugin_id):
+            observed_phases.append(startup_phase.value)
+
+        def create_worker(*args, **kwargs):
+            self.assertEqual(
+                startup_phase.value,
+                PluginStartupPhase.INITIALIZING,
+            )
+            return worker
+
+        with patch(
+            "parallelazy.plugin_worker.default_runtime_settings",
+            return_value=runtime_settings,
+        ), patch(
+            "parallelazy.plugin_worker.configure_worker_logging",
+            return_value=logging_session,
+        ), patch(
+            "parallelazy.plugin_worker.configure_worker_output",
+            return_value=output_capture,
+        ), patch(
+            "parallelazy.plugin_worker.is_debugging_enabled",
+            return_value=True,
+        ), patch(
+            "parallelazy.plugin_worker.init_debugger",
+            side_effect=init_debugger,
+        ), patch(
+            "parallelazy.plugin_worker.PluginWorker",
+            side_effect=create_worker,
+        ):
+            PluginWorker.run(
+                "test-plugin",
+                {},
+                {},
+                Mock(),
+                threading.Event(),
+                startup_phase=startup_phase,
+            )
+
+        self.assertEqual(
+            observed_phases,
+            [PluginStartupPhase.WAITING_FOR_DEBUGGER],
+        )
+        self.assertEqual(startup_phase.value, PluginStartupPhase.INITIALIZING)
+        worker.main.assert_called_once_with()
+        output_capture.close.assert_called_once_with()
+        logging_session.close.assert_called_once_with()
+
+    def test_worker_marks_startup_failed_when_initialization_raises(self):
+        startup_phase = SimpleNamespace(value=int(PluginStartupPhase.NOT_STARTED))
+
+        with patch(
+            "parallelazy.plugin_worker.configure_worker_logging",
+            return_value=Mock(),
+        ), patch(
+            "parallelazy.plugin_worker.configure_worker_output",
+            return_value=Mock(),
+        ), patch(
+            "parallelazy.plugin_worker.is_debugging_enabled",
+            return_value=False,
+        ), patch(
+            "parallelazy.plugin_worker.PluginWorker",
+            side_effect=RuntimeError("initialization failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "initialization failed"):
+                PluginWorker.run(
+                    "test-plugin",
+                    {},
+                    {},
+                    Mock(),
+                    threading.Event(),
+                    runtime_settings=SimpleNamespace(display_logs=True),
+                    startup_phase=startup_phase,
+                )
+
+        self.assertEqual(startup_phase.value, PluginStartupPhase.FAILED)
+
+    def test_process_status_exposes_startup_phase(self):
+        process = Mock()
+        process.is_alive.return_value = False
+        process.pid = 1234
+        manager = PluginManager.__new__(PluginManager)
+        manager._plugins_lock = threading.RLock()
+        manager._plugins = {
+            "test-plugin": PluginInfo(
+                plugin_id="test-plugin",
+                process=process,
+                rpc=Mock(),
+                descriptor=Mock(),
+                options={},
+                startup_phase=SimpleNamespace(
+                    value=int(PluginStartupPhase.WAITING_FOR_DEBUGGER)
+                ),
+            )
+        }
+
+        status = manager.plugin_status("test-plugin")
+
+        self.assertEqual(status.startup_phase, "waiting_for_debugger")
+
     def _start_worker(self, worker):
         thread = threading.Thread(target=worker.main)
         thread.start()
@@ -157,6 +388,10 @@ class PluginLifecycleTests(unittest.TestCase):
         worker = _make_worker(plugin)
         plugin.worker = worker
         thread = self._start_worker(worker)
+        self.assertEqual(
+            worker._startup_phase.value,
+            PluginStartupPhase.READY,
+        )
 
         self.assertTrue(worker.start())
         self.assertTrue(plugin.main_returned.wait(timeout=2))

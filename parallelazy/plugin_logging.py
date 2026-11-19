@@ -25,6 +25,7 @@ class PluginRuntimeSettings:
     log_dir: str
     log_level: int
     display_logs: bool
+    write_logs: bool = True
 
 
 def resolve_directory(path: str, base_dir: Optional[str] = None) -> str:
@@ -58,6 +59,7 @@ def default_runtime_settings() -> PluginRuntimeSettings:
         log_dir=log_dir,
         log_level=logging.INFO,
         display_logs=True,
+        write_logs=True,
     )
 
 
@@ -69,10 +71,17 @@ class _CapturedStreamConsoleFilter(logging.Filter):
 class _TeeTextStream:
     """Mirror worker stream writes to the original stream and its log file."""
 
-    def __init__(self, stream: TextIO, logger: logging.Logger, label: str):
+    def __init__(
+        self,
+        stream: TextIO,
+        logger: logging.Logger,
+        label: str,
+        mirror_to_terminal: bool = True,
+    ):
         self._stream = stream
         self._logger = logger
         self._label = label
+        self._mirror_to_terminal = mirror_to_terminal
         self._buffer = ""
         self._lock = threading.RLock()
         self._logging = threading.local()
@@ -110,9 +119,10 @@ class _TeeTextStream:
         if not isinstance(text, str):
             raise TypeError("write() argument must be str")
         with self._lock:
-            written = self._stream.write(text)
+            written = self._stream.write(text) if self._mirror_to_terminal else len(text)
             if "\r" in text or "\n" in text:
-                self._stream.flush()
+                if self._mirror_to_terminal:
+                    self._stream.flush()
             if not getattr(self._logging, "active", False):
                 self._capture_complete_lines(text)
             return written
@@ -159,11 +169,21 @@ class _TeeTextStream:
 class WorkerOutputCapture:
     """Restore worker streams after teeing their output into the worker log."""
 
-    def __init__(self, logger: logging.Logger):
+    def __init__(self, logger: logging.Logger, display_logs: bool = True):
         self._original_stdout = sys.stdout
         self._original_stderr = sys.stderr
-        self.stdout = _TeeTextStream(self._original_stdout, logger, "stdout")
-        self.stderr = _TeeTextStream(self._original_stderr, logger, "stderr")
+        self.stdout = _TeeTextStream(
+            self._original_stdout,
+            logger,
+            "stdout",
+            mirror_to_terminal=display_logs,
+        )
+        self.stderr = _TeeTextStream(
+            self._original_stderr,
+            logger,
+            "stderr",
+            mirror_to_terminal=display_logs,
+        )
         sys.stdout = self.stdout
         sys.stderr = self.stderr
 
@@ -178,9 +198,12 @@ class WorkerOutputCapture:
                 sys.stderr = self._original_stderr
 
 
-def configure_worker_output(logger: logging.Logger) -> WorkerOutputCapture:
-    """Mirror worker stdout and stderr to both the terminal and plugin log."""
-    return WorkerOutputCapture(logger)
+def configure_worker_output(
+    logger: logging.Logger,
+    display_logs: bool = True,
+) -> WorkerOutputCapture:
+    """Mirror worker stdout and stderr to the plugin log and optionally the terminal."""
+    return WorkerOutputCapture(logger, display_logs=display_logs)
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -339,6 +362,7 @@ class LoggingSession:
         log_level: int,
         display_logs: bool,
         replace_handlers: bool = False,
+        write_logs: bool = True,
     ):
         if isinstance(log_level, bool) or not isinstance(log_level, int):
             raise TypeError("log_level must be an integer logging level")
@@ -357,12 +381,13 @@ class LoggingSession:
         logger.setLevel(log_level)
         logger.propagate = False
 
-        file_handler = _RecoveringFileHandler(log_file)
-        file_handler.setLevel(log_level)
-        file_handler.addFilter(self._context_filter)
-        file_handler.setFormatter(_make_formatter(self.file_format))
-        logger.addHandler(file_handler)
-        self._handlers.append(file_handler)
+        if write_logs:
+            file_handler = _RecoveringFileHandler(log_file)
+            file_handler.setLevel(log_level)
+            file_handler.addFilter(self._context_filter)
+            file_handler.setFormatter(_make_formatter(self.file_format))
+            logger.addHandler(file_handler)
+            self._handlers.append(file_handler)
 
         if display_logs:
             console_handler = logging.StreamHandler(sys.stdout)
@@ -420,6 +445,7 @@ def configure_worker_logging(
         log_level=settings.log_level,
         display_logs=settings.display_logs,
         replace_handlers=True,
+        write_logs=settings.write_logs,
     )
 
 
@@ -428,6 +454,7 @@ def configure_manager_logging(
     log_level: int,
     display_logs: bool,
     run_id: str,
+    write_logs: bool = True,
 ) -> LoggingSession:
     manager_logger = logging.getLogger(f"parallelazy.manager.{run_id}")
     return LoggingSession(
@@ -436,4 +463,5 @@ def configure_manager_logging(
         plugin_id="manager",
         log_level=log_level,
         display_logs=display_logs,
+        write_logs=write_logs,
     )
