@@ -2,13 +2,17 @@
 
 ## Requirements
 
-- Python 3.8 or newer
+- Python 3.11 or newer
 - PyTorch
-- `debugpy` (installed as a runtime dependency)
 
 PyTorch is a required dependency because the process and IPC implementation
 uses `torch.multiprocessing`. CUDA is optional, but applications that use CUDA
 should keep the default `spawn` start method.
+
+`debugpy` is not a framework dependency. For VS Code spawned-worker debugging,
+the companion extension bridges worker attach notifications to VS Code and the
+workers reuse the debugpy version loaded by VS Code. For other debugging setups,
+install and manage debugpy in the application environment yourself.
 
 ## Install
 
@@ -24,9 +28,9 @@ For editable development installation:
 python -m pip install -e .
 ```
 
-The package metadata installs `torch` and `debugpy` automatically. Select the
-PyTorch distribution appropriate for your platform and CUDA version if your
-environment requires a custom PyTorch index.
+The package metadata installs `torch` and `numpy`. Select the PyTorch
+distribution appropriate for your platform and CUDA version if your environment
+requires a custom PyTorch index.
 
 ## Minimal plugin
 

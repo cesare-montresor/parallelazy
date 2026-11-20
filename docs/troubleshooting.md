@@ -53,9 +53,11 @@ The package requests the `spawn` start method. Always protect application
 startup with `if __name__ == "__main__":`. Do not create manager/plugin
 processes as an import-time side effect.
 
-For worker debugging, construct the manager with
-`PluginManager(worker_pydebug=True)`. The worker uses `debugpy` and waits for
-a debugger client, so only enable this when a debugger is ready to attach.
+For worker debugging, attach the debugger to the manager before creating it;
+the manager detects the attached debugger and configures spawned workers. The
+worker waits for a debugger client by default without a deadline. Set
+`timeout_debugger_attach` on `PluginManager` to impose a finite attach timeout;
+`timeout_initialize` applies separately after the debugger attaches.
 
 ## Shutdown hangs or leaves processes
 

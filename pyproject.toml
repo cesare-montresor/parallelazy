@@ -17,10 +17,6 @@ dependencies = [
     "numpy"
 ]
 
-[project.optional-dependencies]
-debug = ["debugpy"]
-
-
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["parallelazy*"]
