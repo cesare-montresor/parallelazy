@@ -1,5 +1,5 @@
 ## Keeping this file current
-Last synced: 0b2b20a8c0aa93b61755a945af0ecc6de1c138b9
+Last synced: a6562a1069125a46a8f01433fa2c8febbe119fa0
 
 At the start of every session:
 1. Find commits since the last sync: `git log --oneline <Last synced hash>..HEAD`
@@ -60,8 +60,9 @@ At the end of every session:
 - Stop waits for an in-progress start, accepted RPC handlers, and active callbacks before
   `on_stop()`. Preserve this ordering and response-drain behavior when changing lifecycle code.
 - The manager owns the shared in-memory environment. Environment updates are dispatched
-  asynchronously to subscribers; `env_subscribe()` delivers the initial value before
-  subsequent updates, and `env_get()` distinguishes stored `None` from unset keys.
+  asynchronously and delivered to worker subscribers in FIFO order; `env_subscribe()`
+  delivers the initial value before subsequent updates, and `env_get()` distinguishes stored
+  `None` from unset keys.
 - Topics are live fan-out through per-subscriber pipe-backed queues with strict pipe
   ownership (subscriber owns read end; manager/publisher own write end). No durable backlog
   or replay; register subscribers before publishing if the first message matters.
@@ -79,8 +80,8 @@ At the end of every session:
   companion integration, not packaged.
 
 ## Commands
-- Run example: `.venv/bin/python -m examples.example_count` (verified).
-- Test: `.venv/bin/python -m unittest discover -s tests` (verified; 68 tests passed).
+- Run example: `.venv/bin/python -m examples.example_quickstart` (verified).
+- Test: `.venv/bin/python -m unittest discover -s tests` (verified; 69 tests passed).
 - Build distributions: `.venv/bin/python -m build` (verified).
 - Lint: no lint command/configuration is defined in this repository.
 - Debug: select a `Debug Example: ...` configuration in `.vscode/launch.json`.
