@@ -21,6 +21,9 @@ At the end of every session:
 - Review `git diff` of this session and propose edits to this file. Add only what
   meets the bar above. Remove stale or redundant lines. Prefer deleting or shortening
   over adding. Keep the file under ~150 lines.
+- If public APIs, lifecycle rules, IPC behavior, logging, or monitoring changed, keep
+  the packaged consumer guide `parallelazy/SKILL.md` updated and aligned in the same
+  session so pip users and downstream agents stay in sync.
 - Do not log individual changes; git history does that.
 - Commit AGENTS.md changes in their own commit: "docs: sync AGENTS.md".
 
@@ -42,7 +45,8 @@ At the end of every session:
 - `tests/`: `unittest` coverage for lifecycle, logging, monitoring, and CUDA IPC.
 - `examples/`: runnable end-to-end plugin examples; invoke as modules from repo root.
 - `docs/`: user-facing setup, concepts, API, examples, monitoring, and troubleshooting.
-- `.github/workflows/publish.yml`: release-branch build and PyPI publishing workflow.
+- `changelogs/`: per-release notes (`vX.Y.Z.md`) and `changelog.sh` generator for root `CHANGELOG.md`.
+- `.github/workflows/publish.yml`: release-branch build, changelog check, and PyPI publishing workflow.
 - `.vscode/launch.json`: debugpy launch configurations for the examples.
 
 ## Key abstractions and invariants
@@ -83,6 +87,7 @@ At the end of every session:
 - Run example: `.venv/bin/python -m examples.example_quickstart` (verified).
 - Test: `.venv/bin/python -m unittest discover -s tests` (verified; 69 tests passed).
 - Build distributions: `.venv/bin/python -m build` (verified).
+- Rebuild changelog: `./changelogs/changelog.sh` (`--check` verifies `CHANGELOG.md` is in sync).
 - Lint: no lint command/configuration is defined in this repository.
 - Debug: select a `Debug Example: ...` configuration in `.vscode/launch.json`.
   Spawned-worker debugging also depends on the companion VS Code extension described in README.
@@ -93,12 +98,17 @@ At the end of every session:
 - Use `with PluginManager() as manager:` or call `PluginManager.unload_all_plugins()` /
   `close()` in `finally` blocks to tear down workers, monitoring, and log handlers.
 - The `pyproject.toml` metadata is the dependency/version source of truth.
+- Changelogs: maintain one `changelogs/vX.Y.Z.md` per release (`## vX.Y.Z (YYYY-MM-DD)` with
+  `### Added`/`Changed`/`Fixed` sections) and regenerate root `CHANGELOG.md` via
+  `./changelogs/changelog.sh`. `.github/workflows/publish.yml` requires `changelogs/v<version>.md`
+  to exist and `CHANGELOG.md` to match before publishing.
 
 ## Do not touch
-- Do not hand-edit generated `parallelazy.egg-info/`, `build/`, `dist/`, or `__pycache__/`.
+- Do not hand-edit generated `CHANGELOG.md`, `parallelazy.egg-info/`, `build/`, `dist/`, or `__pycache__/`.
 - Treat worker startup phases, shared pipe/channel direction, and shutdown/RPC draining as
   coupled protocol behavior; make lifecycle changes with focused tests.
 
 ## Docs
 - Start at `docs/index.md`; detailed lifecycle and concurrency behavior is in `docs/concepts.md`.
 - API contracts are in `docs/api.md`; operational notes are in `docs/troubleshooting.md`.
+- `parallelazy/SKILL.md` is the pip-distributed consumer guide/Agent Skill (`python -m parallelazy agent-guide` / `install-skill`); keep it aligned with public API and usage invariants.

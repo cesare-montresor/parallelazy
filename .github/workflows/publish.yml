@@ -23,19 +23,28 @@ jobs:
           # Forces 3.11 just for this runner so we can use the native tomllib parser
           python-version: "3.11"
 
-      - name: Read version and check tag
+      - name: Read version, check tag, and verify changelog
         id: check_version
         run: |
           # Accurately targets project.version inside the TOML structure
           VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
           TAG_NAME="v$VERSION"
+          CHANGELOG_FILE="changelogs/$TAG_NAME.md"
           
           echo "version=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "changelog_file=$CHANGELOG_FILE" >> $GITHUB_OUTPUT
 
           if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
             echo "::error::Tag $TAG_NAME already exists! Pipeline aborted to prevent duplicate publish."
             exit 1 
           fi
+
+          if [ ! -f "$CHANGELOG_FILE" ]; then
+            echo "::error::Missing $CHANGELOG_FILE! Add release notes and run ./changelogs/changelog.sh before releasing."
+            exit 1
+          fi
+
+          bash ./changelogs/changelog.sh --check
 
       - name: Build distributions
         run: |
@@ -47,7 +56,8 @@ jobs:
         with:
           tag_name: ${{ steps.check_version.outputs.version }}
           name: Release ${{ steps.check_version.outputs.version }}
-          generate_release_notes: true
+          body_path: ${{ steps.check_version.outputs.changelog_file }}
+          generate_release_notes: false
           files: dist/* 
 
       - name: Upload distributions

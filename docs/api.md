@@ -96,6 +96,17 @@ manager.disable_report_hotkey()
 ```
 
 Hotkey capture is opt-in and only available for an interactive TTY.
+
+To continuously overwrite a file with the latest rendered report (useful in another
+terminal with `watch -n 1 cat /path/to/monitor.txt`):
+
+```python
+manager.enable_report_file("monitor.txt")
+# Later:
+manager.disable_report_file()
+```
+
+Both output options can also be switched on via `enable_monitoring(sample_interval=1.0, report_file="monitor.txt", report_hotkey="m")` and toggled independently at any time. File updates use atomic replacement so concurrent readers always see a complete report.
 `MonitoringSnapshot` contains topic, plugin process, environment, and backend
 availability records. Pending pipe bytes are the primary backlog measurement;
 message counts are not estimated.
