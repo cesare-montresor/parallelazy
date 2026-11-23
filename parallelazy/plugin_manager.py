@@ -387,7 +387,9 @@ class PluginManager:
             True if loaded successfully
         """
         plugin_id = descriptor.name
-        options = options or descriptor.options or {}
+        merged_options = dict(descriptor.options or {})
+        merged_options.update(options or {})
+        options = merged_options
 
         with self._plugins_lock:
             if plugin_id in self._plugins or plugin_id in self._loading_plugins:
@@ -489,12 +491,13 @@ class PluginManager:
         Returns:
             True if started successfully
         """
-        if plugin_id not in self._plugins:
+        with self._plugins_lock:
+            info = self._plugins.get(plugin_id)
+        if info is None:
             self.logger.error(f"Plugin {plugin_id} not loaded")
             return False
         
         try:
-            info = self._plugins[plugin_id]
             pending = info.rpc.plugin_start()
             res = pending.wait(timeout=self.timeout_start)
             if not res:
@@ -553,13 +556,14 @@ class PluginManager:
         Returns:
             True if stopped successfully
         """
-        if plugin_id not in self._plugins:
+        with self._plugins_lock:
+            info = self._plugins.get(plugin_id)
+        if info is None:
             return False
         
         try:
-            info = self._plugins[plugin_id]
-            if not info.process.is_alive(): return True  # Already stopped
-
+            if not info.process.is_alive():
+                return True  # Already stopped
 
             pending = info.rpc.plugin_stop()
             res = pending.wait(timeout=self.timeout_start)
@@ -589,16 +593,17 @@ class PluginManager:
             True if unloaded successfully
         """
         try:
-            self.disable_monitoring()
-            if plugin_id in self._plugins:
-                info = self._plugins[plugin_id]
-                if info.process.is_alive() and not info.stop_confirmed:
-                    self.stop_plugin(plugin_id)
-            
-            if plugin_id in self._plugins:
-                info = self._plugins[plugin_id]
+            with self._plugins_lock:
+                info = self._plugins.get(plugin_id)
+
+            if info is not None and info.process.is_alive() and not info.stop_confirmed:
+                self.stop_plugin(plugin_id)
+
+            with self._plugins_lock:
+                info = self._plugins.pop(plugin_id, None)
+
+            if info is not None:
                 process = info.process
-                
                 info.rpc.shutdown()  # Clean up RPC resources
 
                 process.join(timeout=self.timeout_start)
@@ -606,21 +611,18 @@ class PluginManager:
                 if process.is_alive():
                     process.terminate()
                     process.join(timeout=self.timeout_start)
-                    
+
                 if process.is_alive():
                     process.kill()
-                
+                    process.join(timeout=1.0)
+
                 self._cleanup_plugin_registrations(plugin_id)
-                
-                del self._plugins[plugin_id]
             
             self.logger.info(f"Plugin {plugin_id} unloaded")
             return True
             
         except Exception as e:
-            import traceback
-            dump = traceback.print_exc()
-            self.logger.error(f"Error unloading plugin {plugin_id}: {e}\n{dump}", stack_info=True)
+            self.logger.error(f"Error unloading plugin {plugin_id}: {e}", exc_info=True)
             return False
 
     def _cleanup_plugin_registrations(self, plugin_id: str) -> None:
@@ -665,6 +667,18 @@ class PluginManager:
         for plugin_id in plugin_ids:
             self.unload_plugin(plugin_id)
         self.shutdown_env_dispatcher()
+        if getattr(self, "_logging", None) is not None:
+            self._logging.close()
+
+    def close(self) -> None:
+        """Shut down all plugins and release manager resources."""
+        self.unload_all_plugins()
+
+    def __enter__(self) -> "PluginManager":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
     # ========================================================================
     # Utility Methods for Plugin Management
@@ -1031,8 +1045,9 @@ class PluginManager:
             raise ValueError("plugin_id is required")
         if req.plugin_id == rpc.plugin_id:
             raise ValueError("A plugin cannot unload itself through lifecycle RPC")
-        if req.plugin_id not in self._plugins:
-            return False
+        with self._plugins_lock:
+            if req.plugin_id not in self._plugins:
+                return False
         return self.unload_plugin(req.plugin_id)
 
     def _respond_plugin_status(self, rpc: PluginRPC, req: RequestPluginStatus) -> Optional[ProcessStatus]:
@@ -1047,13 +1062,12 @@ class PluginManager:
     # ========================================================================
 
     def _respond_call(self, rpc: PluginRPC, req: RequestPluginCall) -> Any:
-        
-        if req.plugin_id not in self._plugins:
+        with self._plugins_lock:
+            info = self._plugins.get(req.plugin_id)
+        if info is None:
             raise ValueError(f"Plugin {req.plugin_id} not found")
         
-        dst_rpc = self._plugins[req.plugin_id].rpc
-        remote_result = dst_rpc.forward(req)
-        
+        remote_result = info.rpc.forward(req)
         return remote_result
     
     # ========================================================================

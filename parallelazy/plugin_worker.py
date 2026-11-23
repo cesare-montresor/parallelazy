@@ -247,14 +247,15 @@ class PluginWorker:
         self._start_complete = False
         self._active_callbacks = 0
         
-        # Topic subscriptions: topic_name -> queue
-        
+        # Topic subscriptions: topic_name -> Subscription
         self.topic_published = set()
         self.topic_subscriptions: Dict[str, Subscription] = {}
-        self.topic_subscribers: Dict[str, Dict[str,Subscriber]] = {}
+        self.topic_subscribers: Dict[str, Dict[str, Subscriber]] = {}
         self._topic_subscribers_lock = threading.RLock()
-        # Topic subscriptions: topic_name -> queue
+        # Env subscriptions: var_name -> callback
         self.env_subscriptions: Dict[str, Callable] = {}
+        self._env_subscriptions_lock = threading.RLock()
+        self._env_initializing: Dict[str, list] = {}
         
         # Error log
         self.error_log: list = []
@@ -372,8 +373,24 @@ class PluginWorker:
         # Let stop handlers send their responses before closing the channel.
         self.rpc.drain_commands()
 
+    def _get_topic_lock(self) -> threading.RLock:
+        lock = getattr(self, "_topic_subscribers_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._topic_subscribers_lock = lock
+        return lock
+
+    def _get_env_lock(self) -> threading.RLock:
+        lock = getattr(self, "_env_subscriptions_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._env_subscriptions_lock = lock
+        return lock
+
     def _wake_topic_listeners(self) -> None:
-        for topic, subscription in list(self.topic_subscriptions.items()):
+        with self._get_topic_lock():
+            items = list(self.topic_subscriptions.items())
+        for topic, subscription in items:
             try:
                 if hasattr(subscription, "signal_stop"):
                     subscription.signal_stop()
@@ -763,26 +780,52 @@ class PluginWorker:
         timeout: Optional[float] = None,
     ) -> bool:
         """Subscribe to environment updates and invoke callback with the value."""
-        pending: PendingRequest = self.rpc.env_subscribe(var_name)
+        env_lock = self._get_env_lock()
+        if not hasattr(self, "_env_initializing"):
+            self._env_initializing = {}
+        with env_lock:
+            self._env_initializing[var_name] = []
+
         effective_timeout = self._resolve_timeout(timeout)
+        pending: PendingRequest = self.rpc.env_subscribe(var_name)
         response = pending.wait(timeout=effective_timeout)
         if response is None:
+            with env_lock:
+                self._env_initializing.pop(var_name, None)
             msg = f"Timed out subscribing to env variable '{var_name}' after {effective_timeout}s"
             logger.error(msg)
             self.error_log.append(msg)
             return False
         if response.error:
+            with env_lock:
+                self._env_initializing.pop(var_name, None)
             logger.error(f"Error subscribing to env variable '{var_name}': {response.error}")
             self.error_log.append(str(response.error))
             return False
-        
-        self.env_subscriptions[var_name] = callback
 
-        initial = self.rpc.env_get(var_name).wait(timeout=effective_timeout)
-        if initial is not None and not initial.error:
-            callback(initial.result)
-        else:
-            callback(None)
+        try:
+            initial = self.rpc.env_get(var_name).wait(timeout=effective_timeout)
+            if initial is not None and not initial.error:
+                callback(initial.result)
+            else:
+                callback(None)
+
+            while True:
+                with env_lock:
+                    queued = self._env_initializing.get(var_name)
+                    if not queued:
+                        self._env_initializing.pop(var_name, None)
+                        self.env_subscriptions[var_name] = callback
+                        break
+                    batch = list(queued)
+                    queued.clear()
+                for val in batch:
+                    callback(val)
+        except Exception:
+            with env_lock:
+                self._env_initializing.pop(var_name, None)
+                self.env_subscriptions[var_name] = callback
+            raise
 
         return True
     
@@ -808,8 +851,10 @@ class PluginWorker:
             self.error_log.append(str(response.error))
             return False
         
-        if var_name in self.env_subscriptions:
-            del self.env_subscriptions[var_name]
+        with self._get_env_lock():
+            self.env_subscriptions.pop(var_name, None)
+            if hasattr(self, "_env_initializing"):
+                self._env_initializing.pop(var_name, None)
         return True
     
 
@@ -850,7 +895,11 @@ class PluginWorker:
             return False
         if response.result:
             subscription.thread = threading.Thread(target=self._topic_listener, args=(topic,), daemon=True)
-            self.topic_subscriptions[topic] = subscription
+            with self._get_topic_lock():
+                previous = self.topic_subscriptions.get(topic)
+                self.topic_subscriptions[topic] = subscription
+            if previous is not None and previous is not subscription:
+                previous.close()
             subscription.thread.start()
         else:
             subscription.close()
@@ -862,11 +911,12 @@ class PluginWorker:
         timeout: Optional[float] = None,
     ) -> bool:
         """Unsubscribe from a topic."""
-        if topic not in self.topic_subscriptions:
+        with self._get_topic_lock():
+            subscription = self.topic_subscriptions.get(topic)
+        if subscription is None:
             logger.warning("Not subscribed to topic '%s'", topic)
             return True
         
-        subscription = self.topic_subscriptions[topic]
         subscriber = Subscriber(self.plugin_id, topic, QueueDescriptor())
 
         pending: PendingRequest = self.rpc.topic_unsubscribe(subscriber)
@@ -883,7 +933,8 @@ class PluginWorker:
             return False
         
         if response.result:
-            del self.topic_subscriptions[topic]
+            with self._get_topic_lock():
+                self.topic_subscriptions.pop(topic, None)
             subscription.signal_stop()
             if subscription.thread is not None and subscription.thread.is_alive():
                 subscription.thread.join(timeout=1.0)
@@ -920,10 +971,9 @@ class PluginWorker:
     def topic_announce(self, topic: str, timeout: Optional[float] = None) -> bool:
         """Announce a topic to manager and sync subscribers."""
         # first time publishing this topic
-        if topic in self.topic_published:
-            return True
-
-        with self._topic_subscribers_lock:
+        with self._get_topic_lock():
+            if topic in self.topic_published:
+                return True
             if topic not in self.topic_subscribers:
                 self.topic_subscribers[topic] = {}
             topic_subscribers = self.topic_subscribers[topic]
@@ -940,11 +990,10 @@ class PluginWorker:
             return False
         
 
-        self.topic_published.add(topic)
-
         manager_subscribers: Dict[str, Subscriber] = response.result
 
-        with self._topic_subscribers_lock:
+        with self._get_topic_lock():
+            self.topic_published.add(topic)
             for sub in manager_subscribers.values():
                 if sub.plugin_id not in topic_subscribers:
                     sub.queue = Queue(sub.queue_descriptor)
@@ -992,9 +1041,10 @@ class PluginWorker:
     
     def _respond_status(self, rpc: PluginRPC, req: RequestPluginStatus) -> Dict[str, Any]:
         """Get plugin status."""
-        num_subscription = len(self.topic_subscriptions.keys())
-        num_subscribers = sum(len(subs) for subs in self.topic_subscribers.values())
-        num_published = len(self.topic_published)
+        with self._get_topic_lock():
+            num_subscription = len(self.topic_subscriptions)
+            num_subscribers = sum(len(subs) for subs in self.topic_subscribers.values())
+            num_published = len(self.topic_published)
         num_errors = len(self.error_log)
 
         status = PluginStatus(
@@ -1034,7 +1084,12 @@ class PluginWorker:
     def _respond_env_update(self, rpc: PluginRPC, req: RequestEnvUpdate) -> None:
         """Receive environment variable change notification."""
         var_name = req.name
-        callback = self.env_subscriptions.get(var_name)
+        with self._get_env_lock():
+            initializing = getattr(self, "_env_initializing", None)
+            if initializing is not None and var_name in initializing:
+                initializing[var_name].append(req.value)
+                return True
+            callback = self.env_subscriptions.get(var_name)
         if callback is None:
             return True
         self._invoke_callback(callback, req.value)
@@ -1158,5 +1213,6 @@ class PluginWorker:
     
     def _request_topic_list(self, rpc: PluginRPC, req: RequestTopicList) -> list:
         """Handle topic list request."""
-        return sorted(self.topic_published)
+        with self._get_topic_lock():
+            return sorted(self.topic_published)
     
