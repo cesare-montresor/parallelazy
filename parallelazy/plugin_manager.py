@@ -26,7 +26,7 @@ from parallelazy.plugin_logging import (
     resolve_directory,
 )
 from parallelazy.plugin_rpc import PluginRPC, RequestEnvGetAll, RequestEnvUnsubscribe, RequestTopicAnnounce
-from parallelazy.plugin_transport import release_cuda_ipc, sanitize_for_ipc
+from parallelazy.plugin_transport import release_cuda_ipc, sanitize_for_ipc, sanitize_for_ipc_with_info
 from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe
 from parallelazy.plugin_data import  CommandType, ENV_MISSING, PluginStartupPhase, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginErrors, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, Subscriber
 from parallelazy.environment_manager import EnvironmentManager
@@ -1001,7 +1001,7 @@ class PluginManager:
         Returns:
             Number of subscribers that received the message
         """
-        data = sanitize_for_ipc(data)
+        data, has_tensor = sanitize_for_ipc_with_info(data)
         with self._plugins_lock:
             subscribers = list(self._topic_subscribers.get(topic, {}).items())
 
@@ -1009,7 +1009,9 @@ class PluginManager:
             return 0
 
         from parallelazy.plugin_worker import _deliver_to_subscribers
-        delivered, dead_ids = _deliver_to_subscribers(topic, data, subscribers, self.logger)
+        delivered, dead_ids = _deliver_to_subscribers(
+            topic, data, subscribers, self.logger, has_tensor=has_tensor
+        )
 
         if dead_ids:
             with self._plugins_lock:

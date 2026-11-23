@@ -13,12 +13,11 @@ Command dispatch:
 
 import logging
 import importlib
+import selectors
 import threading
 import traceback
-from multiprocessing.connection import wait as conn_wait
 from multiprocessing.reduction import ForkingPickler
 from multiprocessing.sharedctypes import Synchronized
-import torch
 
 from parallelazy.utils import init_debugger, is_debugging_enabled
 from parallelazy.plugin_data import (
@@ -51,7 +50,7 @@ from parallelazy.plugin_logging import (
 )
 
 from parallelazy.plugin_rpc import  PluginRPC, RequestEnvUpdate, RequestPluginCall, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe, sanitize_for_ipc
-from parallelazy.plugin_transport import release_cuda_ipc
+from parallelazy.plugin_transport import release_cuda_ipc, sanitize_for_ipc_with_info
 from multiprocessing.synchronize import Event
 
 
@@ -71,37 +70,16 @@ def _set_startup_phase(
         startup_phase.value = int(phase)
 
 
-def _contains_torch_tensor(obj: Any, _seen: Optional[set] = None) -> bool:
-    if isinstance(obj, torch.Tensor):
-        return True
-    if isinstance(obj, (str, bytes, int, float, bool, type(None))):
-        return False
-    if _seen is None:
-        _seen = set()
-    obj_id = id(obj)
-    if obj_id in _seen:
-        return False
-    if isinstance(obj, dict):
-        _seen.add(obj_id)
-        return any(
-            _contains_torch_tensor(k, _seen) or _contains_torch_tensor(v, _seen)
-            for k, v in obj.items()
-        )
-    if isinstance(obj, (list, tuple, set, frozenset)):
-        _seen.add(obj_id)
-        return any(_contains_torch_tensor(item, _seen) for item in obj)
-    return False
-
-
 def _deliver_to_subscribers(
     topic: str,
     data: Any,
     subscribers: list,
     log: logging.Logger,
+    has_tensor: bool = False,
 ) -> tuple[int, list[str]]:
     """Fan out a payload to subscribers, isolating failures and reporting dead IDs."""
     payload_bytes = None
-    if len(subscribers) > 1 and not _contains_torch_tensor(data):
+    if len(subscribers) > 1 and not has_tensor:
         try:
             payload_bytes = bytes(ForkingPickler.dumps(data))
         except Exception:
@@ -1076,7 +1054,7 @@ class PluginWorker:
         return True
 
     def topic_publish(self, topic: str, data: Any) -> int:
-        data = sanitize_for_ipc(data)
+        data, has_tensor = sanitize_for_ipc_with_info(data)
 
         self.topic_announce(topic)
         
@@ -1085,7 +1063,9 @@ class PluginWorker:
         if not subscribers:
             return 0
 
-        delivered, dead_ids = _deliver_to_subscribers(topic, data, subscribers, logger)
+        delivered, dead_ids = _deliver_to_subscribers(
+            topic, data, subscribers, logger, has_tensor=has_tensor
+        )
 
         if dead_ids:
             with self._topic_subscribers_lock:
@@ -1200,66 +1180,81 @@ class PluginWorker:
         self.did_start.wait()  # Ensure plugin has started before processing messages
         with getattr(self, "_topic_subscribers_lock", threading.RLock()):
             registered = self.topic_subscriptions.get(topic)
-        
-        while True:
-            
-            if self._is_running is False:
-                logger.info("Worker stopping, exiting topic listener for '%s'", topic)
-                break
+        if registered is None:
+            return
 
-            # check is subscription still active (in case unsubscribed while waiting for data)
-            with getattr(self, "_topic_subscribers_lock", threading.RLock()):
-                cur = self.topic_subscriptions.get(topic,None)
-            if cur is None or cur != registered: 
-                logger.info(f"Subscription for topic '{topic}' no longer registered, stopping listener thread")
-                break
-            
-
-            # pull data from subscription queue (blocking)
+        wakeup_r = getattr(registered, "_wakeup_r", None)
+        receiver = getattr(registered.queue, "receiver", None)
+        recv_conn = receiver._conn if receiver is not None else None
+        selector = None
+        if wakeup_r is not None and recv_conn is not None:
+            selector = selectors.DefaultSelector()
             try:
-                wakeup_r = getattr(registered, "_wakeup_r", None)
-                receiver = getattr(registered.queue, "receiver", None)
-                if wakeup_r is not None and receiver is not None:
-                    ready = conn_wait([receiver._conn, wakeup_r])
-                    if wakeup_r in ready:
-                        logger.info("Received shutdown signal for topic '%s'", topic)
+                selector.register(recv_conn, selectors.EVENT_READ, data="data")
+                selector.register(wakeup_r, selectors.EVENT_READ, data="stop")
+            except Exception:
+                selector.close()
+                selector = None
+
+        try:
+            while True:
+                if self._is_running is False or getattr(registered, "_stopped", False):
+                    logger.info("Worker stopping, exiting topic listener for '%s'", topic)
+                    break
+
+                # check is subscription still active (in case unsubscribed while waiting for data)
+                with getattr(self, "_topic_subscribers_lock", threading.RLock()):
+                    cur = self.topic_subscriptions.get(topic, None)
+                if cur is None or cur != registered:
+                    logger.info(f"Subscription for topic '{topic}' no longer registered, stopping listener thread")
+                    break
+
+                # pull data from subscription queue (fast path if already buffered, else reusable selector)
+                try:
+                    if selector is not None and not recv_conn.poll(0):
+                        events = selector.select()
+                        if any(key.data == "stop" for key, _ in events):
+                            logger.info("Received shutdown signal for topic '%s'", topic)
+                            break
+                    data = registered.queue.get()  # Blocking wait for new data
+                    if isinstance(data, _TopicShutdownSentinel):
+                        logger.info("Received shutdown sentinel for topic '%s'", topic)
                         break
-                data = registered.queue.get()  # Blocking wait for new data
-                if isinstance(data, _TopicShutdownSentinel):
-                    logger.info("Received shutdown sentinel for topic '%s'", topic)
+                except ValueError as e:
+                    if registered.queue.closed():
+                        logger.info(f"Subscription for topic '{topic}' queue closed, stopping listener thread")
+                        break
+                    else:
+                        logger.error(f"Error getting data from topic '{topic}' queue: {e}")
+                        self.error_log.append(str(e))
+                        continue
+                except (EOFError, OSError) as e:
+                    logger.info(
+                        "Subscription for topic '%s' closed, stopping listener thread: %s",
+                        topic,
+                        e,
+                    )
                     break
-            except ValueError as e:
-                if registered.queue.closed():
-                    logger.info(f"Subscription for topic '{topic}' queue closed, stopping listener thread")
-                    break
-                else:
-                    logger.error(f"Error getting data from topic '{topic}' queue: {e}")
+                except Exception as e:
+                    logger.error(f"Error in topic '{topic}' listener: {e}", exc_info=True)
                     self.error_log.append(str(e))
                     continue
-            except (EOFError, OSError) as e:
-                logger.info(
-                    "Subscription for topic '%s' closed, stopping listener thread: %s",
-                    topic,
-                    e,
-                )
-                break
-            except Exception as e:
-                logger.error(f"Error in topic '{topic}' listener: {e}", exc_info=True)
-                self.error_log.append(str(e))
-                continue
 
-            # Call the plugin's callback with the new data
-            try:
-                self._invoke_callback(registered.callback, data)
-            except Exception as e:
-                logger.error(
-                    "Error in topic '%s' callback: %s",
-                    topic,
-                    e,
-                    exc_info=True,
-                )
-                self._record_error(e, source=f"topic:{topic}")
-                continue
+                # Call the plugin's callback with the new data
+                try:
+                    self._invoke_callback(registered.callback, data)
+                except Exception as e:
+                    logger.error(
+                        "Error in topic '%s' callback: %s",
+                        topic,
+                        e,
+                        exc_info=True,
+                    )
+                    self._record_error(e, source=f"topic:{topic}")
+                    continue
+        finally:
+            if selector is not None:
+                selector.close()
     
     def _respond_topic_subscribe(self, rpc: PluginRPC, req: RequestTopicSubscribe) -> bool:
         """Handle topic subscribe request."""

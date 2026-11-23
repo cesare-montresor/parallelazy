@@ -98,14 +98,16 @@ def _deepcopy_without_hooks(module: nn.Module) -> nn.Module:
                 setattr(m, name, val)
 
 
-def _sanitize_recursive(obj: Any, memo: Dict[int, Any]) -> Any:
+def _sanitize_recursive(obj: Any, memo: Dict[int, Any], has_tensor: list[bool]) -> Any:
     if obj is None or isinstance(obj, (bool, int, float, str, bytes, bytearray)):
         return obj
 
     if isinstance(obj, torch.Tensor):
+        has_tensor[0] = True
         return obj.clone() if _is_ipc_received(obj) else obj
 
     if isinstance(obj, nn.Module):
+        has_tensor[0] = True
         return _deepcopy_without_hooks(obj) if _module_needs_clone(obj) else obj
 
     obj_id = id(obj)
@@ -116,50 +118,50 @@ def _sanitize_recursive(obj: Any, memo: Dict[int, Any]) -> Any:
         rebuilt = OrderedDict()
         memo[obj_id] = rebuilt
         for k, v in obj.items():
-            rebuilt[k] = _sanitize_recursive(v, memo)
+            rebuilt[k] = _sanitize_recursive(v, memo, has_tensor)
         return rebuilt
 
     if isinstance(obj, defaultdict):
         rebuilt = defaultdict(obj.default_factory)
         memo[obj_id] = rebuilt
         for k, v in obj.items():
-            rebuilt[k] = _sanitize_recursive(v, memo)
+            rebuilt[k] = _sanitize_recursive(v, memo, has_tensor)
         return rebuilt
 
     if isinstance(obj, dict):
         rebuilt = {}
         memo[obj_id] = rebuilt
         for k, v in obj.items():
-            rebuilt[k] = _sanitize_recursive(v, memo)
+            rebuilt[k] = _sanitize_recursive(v, memo, has_tensor)
         return rebuilt
 
     if isinstance(obj, list):
         rebuilt = []
         memo[obj_id] = rebuilt
         for item in obj:
-            rebuilt.append(_sanitize_recursive(item, memo))
+            rebuilt.append(_sanitize_recursive(item, memo, has_tensor))
         return rebuilt
 
     if isinstance(obj, tuple):
         if hasattr(obj, "_fields"):
             # namedtuple
-            cloned = tuple(_sanitize_recursive(v, memo) for v in obj)
+            cloned = tuple(_sanitize_recursive(v, memo, has_tensor) for v in obj)
             return type(obj)(*cloned)
-        cloned = [_sanitize_recursive(v, memo) for v in obj]
+        cloned = [_sanitize_recursive(v, memo, has_tensor) for v in obj]
         return type(obj)(cloned)
 
     if isinstance(obj, set):
-        return {_sanitize_recursive(v, memo) for v in obj}
+        return {_sanitize_recursive(v, memo, has_tensor) for v in obj}
 
     if isinstance(obj, frozenset):
-        return frozenset(_sanitize_recursive(v, memo) for v in obj)
+        return frozenset(_sanitize_recursive(v, memo, has_tensor) for v in obj)
 
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         memo[obj_id] = obj
         changed: Dict[str, Any] = {}
         for f in dataclasses.fields(obj):
             old_val = getattr(obj, f.name)
-            new_val = _sanitize_recursive(old_val, memo)
+            new_val = _sanitize_recursive(old_val, memo, has_tensor)
             if new_val is not old_val:
                 changed[f.name] = new_val
         if not changed:
@@ -184,6 +186,15 @@ def _sanitize_recursive(obj: Any, memo: Dict[int, Any]) -> Any:
     return obj
 
 
+def sanitize_for_ipc_with_info(obj: Any) -> tuple[Any, bool]:
+    """
+    Like `sanitize_for_ipc(obj)`, but returns `(sanitized_obj, has_tensor)` in a
+    single traversal so callers can avoid a second walk to detect tensors.
+    """
+    has_tensor = [False]
+    return _sanitize_recursive(obj, {}, has_tensor), has_tensor[0]
+
+
 def sanitize_for_ipc(obj: Any) -> Any:
     """
     Recursively return a version of `obj` safe to put on a
@@ -195,7 +206,7 @@ def sanitize_for_ipc(obj: Any) -> Any:
         -> traversed recursively with cycle detection, preserving container types
       - anything else -> returned unchanged
     """
-    return _sanitize_recursive(obj, {})
+    return _sanitize_recursive(obj, {}, [False])
 
 
 # =====================================================================
