@@ -140,11 +140,13 @@ class TransportSanitizationTests(unittest.TestCase):
         ev1.record()
         # Even after GPU work completes, slot must remain busy until ev1.clear()
         ev1.ready.synchronize()
+        self.assertFalse(ev1.is_cleared())
         self.assertTrue(pool.has_busy())
         self.assertFalse(pool.wait_all_free(timeout=0.05))
 
         ev1.clear()
         self.assertTrue(pool.wait_all_free(timeout=2.0))
+        self.assertTrue(ev1.is_cleared())
         self.assertFalse(pool.has_busy())
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")

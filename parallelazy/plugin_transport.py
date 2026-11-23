@@ -234,6 +234,12 @@ class IpcEventCuda:
         if self._ack_seq is not None:
             self._ack_seq[0] = self._seq
 
+    def is_cleared(self) -> bool:
+        """Return True once the consumer has called clear() for this generation and GPU work completed."""
+        if self._ack_seq is not None and int(self._ack_seq[0].item()) < self._seq:
+            return False
+        return self.release.query()
+
 
 class _IpcEventSlot:
     """
