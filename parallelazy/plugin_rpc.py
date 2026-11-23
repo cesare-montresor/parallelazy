@@ -120,7 +120,8 @@ class PluginCoreRPC:
         
         
         # Step 3: Wait for reader thread to exit
-        self._reader.join(timeout=2.0)
+        if self._reader.is_alive():
+            self._reader.join(timeout=2.0)
         if self._reader.is_alive():
             logger.warning("Reader thread did not exit cleanly")
 
