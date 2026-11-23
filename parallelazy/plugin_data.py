@@ -60,6 +60,14 @@ class _TopicShutdownSentinel:
 _TOPIC_SHUTDOWN_SENTINEL = _TopicShutdownSentinel()
 
 
+class _EnvMissing:
+    """Sentinel indicating an environment key is not set (distinct from stored None)."""
+    pass
+
+
+ENV_MISSING = _EnvMissing()
+
+
 class QueueDescriptor:
     """Descriptor for holding read/write connections representing a pipe-backed queue."""
     def __init__(
@@ -88,10 +96,10 @@ class Queue:
         if descriptor is None:
             receive, send = mp.Pipe(duplex=False)
             self._send = QueueSend(send)
-            self._receive = QueueRecive(receive)
+            self._receive = QueueReceive(receive)
         else:
             self._send = QueueSend(descriptor.send) if descriptor.send is not None else None
-            self._receive = QueueRecive(descriptor.receive) if descriptor.receive is not None else None
+            self._receive = QueueReceive(descriptor.receive) if descriptor.receive is not None else None
 
     @property
     def sender(self):
@@ -177,7 +185,7 @@ class QueueSend:
         self._conn.close()
 
 
-class QueueRecive:
+class QueueReceive:
     def __init__(self, conn: Connection):
         self._conn = conn
 
@@ -186,6 +194,10 @@ class QueueRecive:
 
     def close(self):
         self._conn.close()
+
+
+# Backwards-compatible alias for the legacy misspelled name.
+QueueRecive = QueueReceive
 
 class Channel:
     """
@@ -198,12 +210,12 @@ class Channel:
             r1, w1 = mp.Pipe(duplex=False)
             r2, w2 = mp.Pipe(duplex=False)
             self._send = QueueSend(w1)
-            self._receive = QueueRecive(r2)
+            self._receive = QueueReceive(r2)
             self._remote_send = QueueSend(w2)
-            self._remote_receive = QueueRecive(r1)
+            self._remote_receive = QueueReceive(r1)
         else:
             self._send = QueueSend(descriptor.send)
-            self._receive = QueueRecive(descriptor.receive)
+            self._receive = QueueReceive(descriptor.receive)
             self._remote_send = None
             self._remote_receive = None
 

@@ -51,16 +51,17 @@ def plugin_log_filename(plugin_id: str) -> str:
     return f"{readable_id}-{suffix}.log"
 
 
-def default_runtime_settings() -> PluginRuntimeSettings:
+def default_runtime_settings(write_logs: bool = True) -> PluginRuntimeSettings:
     work_dir = resolve_directory(os.getcwd())
     log_dir = os.path.join(resolve_directory("logs", work_dir), create_run_id())
-    os.makedirs(log_dir, exist_ok=True)
+    if write_logs:
+        os.makedirs(log_dir, exist_ok=True)
     return PluginRuntimeSettings(
         work_dir=work_dir,
         log_dir=log_dir,
         log_level=logging.INFO,
         display_logs=True,
-        write_logs=True,
+        write_logs=write_logs,
     )
 
 
@@ -234,7 +235,7 @@ def _utc_timestamp() -> str:
 class _RecoveringFileHandler(logging.Handler):
     """Append to a log file and recreate it if its path or parent is removed."""
 
-    terminator = os.linesep
+    terminator = "\n"
 
     def __init__(self, filename: str):
         super().__init__()

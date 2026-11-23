@@ -90,10 +90,12 @@ def init_debugger(process_name: str = 'worker', wait_for_client: bool = True) ->
 
 def process_start_spawn(force=False):
     current = mp.get_start_method(allow_none=True)
-    if current not in ('spawn', None):
-        warnings.warn(f"Expected spawn start method, got '{current}'. CUDA may be unreliable.")
-    elif current is None:
+    if current == 'spawn':
+        return
+    if current is None or force:
         mp.set_start_method('spawn', force=force)
+    else:
+        warnings.warn(f"Expected spawn start method, got '{current}'. CUDA may be unreliable.")
 
 def camel_to_kebab(text):
     s1 = re.sub('(.)([A-Z][a-z]+)', r'\1-\2', text)

@@ -75,13 +75,17 @@ class EnvironmentManager:
         for key, value in env_dict.items():
             self.set(key, value)
     
-    def clear(self, key: str=None) -> None:
-        """Clear a specific environment variable."""
+    def clear(self, key: str = None) -> None:
+        """Clear a specific environment variable, or all variables when key is None."""
         with self._lock:
-            if key in self._env:
-                del self._env[key]
-            else:
+            if key is None:
                 self._env.clear()
+                self._write_counts.clear()
+                self._last_write_times.clear()
+            else:
+                self._env.pop(key, None)
+                self._write_counts.pop(key, None)
+                self._last_write_times.pop(key, None)
     
     def __contains__(self, key: str) -> bool:
         """Check if key exists in environment."""

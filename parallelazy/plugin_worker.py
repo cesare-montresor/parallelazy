@@ -24,6 +24,7 @@ from parallelazy.utils import init_debugger, is_debugging_enabled
 from parallelazy.plugin_data import (
     Channel,
     CommandType,
+    _EnvMissing,
     PluginStartupPhase,
     ProcessStatus,
     Queue,
@@ -796,6 +797,7 @@ class PluginWorker:
     def env_get(
         self,
         var_name: str,
+        default: Any = None,
         wait: bool = True,
         timeout: Optional[float] = None,
     ) -> PendingRequest | Any:
@@ -810,11 +812,13 @@ class PluginWorker:
             msg = f"Timed out getting env variable '{var_name}' after {effective_timeout}s"
             logger.error(msg)
             self.error_log.append(msg)
-            return None
+            return default
         if response.error:
             logger.error(f"Error getting env variable: {response.error}")
             self.error_log.append(str(response.error))
-            return None
+            return default
+        if isinstance(response.result, _EnvMissing):
+            return default
         return response.result
     
     def env_get_all(
@@ -872,7 +876,7 @@ class PluginWorker:
 
         try:
             initial = self.rpc.env_get(var_name).wait(timeout=effective_timeout)
-            if initial is not None and not initial.error:
+            if initial is not None and not initial.error and not isinstance(initial.result, _EnvMissing):
                 callback(initial.result)
             else:
                 callback(None)

@@ -28,7 +28,7 @@ from parallelazy.plugin_logging import (
 from parallelazy.plugin_rpc import PluginRPC, RequestEnvGetAll, RequestEnvUnsubscribe, RequestTopicAnnounce
 from parallelazy.plugin_transport import sanitize_for_ipc
 from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe
-from parallelazy.plugin_data import  CommandType, PluginStartupPhase, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginErrors, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, Subscriber
+from parallelazy.plugin_data import  CommandType, ENV_MISSING, PluginStartupPhase, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginErrors, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, Subscriber
 from parallelazy.environment_manager import EnvironmentManager
 
 
@@ -113,7 +113,8 @@ class PluginManager:
         self.run_id = create_run_id()
         self.run_log_dir = os.path.join(self.log_dir, self.run_id)
         os.makedirs(self._work_dir, exist_ok=True)
-        os.makedirs(self.run_log_dir, exist_ok=True)
+        if write_logs:
+            os.makedirs(self.run_log_dir, exist_ok=True)
 
         self._logging = configure_manager_logging(
             os.path.join(self.run_log_dir, "manager.log"),
@@ -197,7 +198,8 @@ class PluginManager:
 
     def _update_log_dir(self, log_dir: str) -> None:
         run_log_dir = os.path.join(log_dir, self.run_id)
-        os.makedirs(run_log_dir, exist_ok=True)
+        if self.write_logs:
+            os.makedirs(run_log_dir, exist_ok=True)
         self._logging.set_log_file(os.path.join(run_log_dir, "manager.log"))
         self._log_dir = log_dir
         self.run_log_dir = run_log_dir
@@ -235,8 +237,14 @@ class PluginManager:
             else resolve_directory(descriptor.log_dir, work_dir)
         )
         run_log_dir = os.path.join(log_dir, self.run_id)
+        effective_write_logs = (
+            self.write_logs
+            if descriptor.write_logs is None
+            else descriptor.write_logs
+        )
         os.makedirs(work_dir, exist_ok=True)
-        os.makedirs(run_log_dir, exist_ok=True)
+        if effective_write_logs:
+            os.makedirs(run_log_dir, exist_ok=True)
         return PluginRuntimeSettings(
             work_dir=work_dir,
             log_dir=run_log_dir,
@@ -248,11 +256,7 @@ class PluginManager:
                 if descriptor.display_logs is None
                 else descriptor.display_logs
             ),
-            write_logs=(
-                self.write_logs
-                if descriptor.write_logs is None
-                else descriptor.write_logs
-            ),
+            write_logs=effective_write_logs,
             timeout_request=self.timeout_request,
         )
 
@@ -1155,7 +1159,7 @@ class PluginManager:
         return self.env_set(req.name, req.value)
     
     def _respond_env_get(self, rpc: PluginRPC, req: RequestEnvGet) -> Any:
-        return self.env_get(req.name)
+        return self._env.get(req.name, ENV_MISSING)
     
     def _respond_env_get_all(self, rpc: PluginRPC, req: RequestEnvGetAll) -> Dict[str, Any]:
         return self.env_get()

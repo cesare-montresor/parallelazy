@@ -123,7 +123,9 @@ class Plugin:
         key = plugin_name or cls.__name__
         
         if key in cls._registry:
-            raise ValueError(f"Plugin '{key}' is already registered.")
+            logging.getLogger(__name__).debug(
+                "Overwriting existing plugin registration for '%s'", key
+            )
             
         cls._registry[key] = cls
 
@@ -149,6 +151,11 @@ class Plugin:
         all_options = cls.default_options().copy()
         all_options.update(options or {})
 
+        resolved_description = (
+            description
+            if description is not None
+            else (cls.__doc__.strip() if cls.__doc__ else "")
+        )
 
         return PluginDescriptor(
             version=version,
@@ -157,7 +164,7 @@ class Plugin:
             name= camel_to_kebab(name or cls.__name__),
             package=f"{cls.__module__}",
             class_name=cls.__name__,
-            description=description or f"{cls.__doc__}",
+            description=resolved_description,
             work_dir=work_dir,
             log_dir=log_dir,
             log_level=log_level,
@@ -263,8 +270,7 @@ class Plugin:
         if name is None:
             return self._worker.env_get_all()
 
-        value = self._worker.env_get(name)
-        return default if value is None else value
+        return self._worker.env_get(name, default=default)
     
     def env_subscribe(self, name: str, callback: Callable) -> bool:
         """Subscribe to changes in an environment variable."""
