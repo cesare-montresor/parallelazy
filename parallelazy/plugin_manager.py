@@ -26,7 +26,7 @@ from parallelazy.plugin_logging import (
     resolve_directory,
 )
 from parallelazy.plugin_rpc import PluginRPC, RequestEnvGetAll, RequestEnvUnsubscribe, RequestTopicAnnounce
-from parallelazy.plugin_transport import sanitize_for_ipc
+from parallelazy.plugin_transport import release_cuda_ipc, sanitize_for_ipc
 from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe
 from parallelazy.plugin_data import  CommandType, ENV_MISSING, PluginStartupPhase, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginErrors, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, Subscriber
 from parallelazy.environment_manager import EnvironmentManager
@@ -691,12 +691,14 @@ class PluginManager:
     def unload_all_plugins(self) -> None:
         """Shut down the plugin manager and all plugins."""
         self.disable_monitoring()
+        release_cuda_ipc()
         self.stop_all_plugins()
         with self._plugins_lock:
             plugin_ids = list(self._plugins.keys())
         for plugin_id in plugin_ids:
             self.unload_plugin(plugin_id)
         self.shutdown_env_dispatcher()
+        release_cuda_ipc()
         if getattr(self, "_logging", None) is not None:
             self._logging.close()
 

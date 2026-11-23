@@ -51,6 +51,7 @@ from parallelazy.plugin_logging import (
 )
 
 from parallelazy.plugin_rpc import  PluginRPC, RequestEnvUpdate, RequestPluginCall, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe, sanitize_for_ipc
+from parallelazy.plugin_transport import release_cuda_ipc
 from multiprocessing.synchronize import Event
 
 
@@ -408,6 +409,8 @@ class PluginWorker:
         except Exception as e:
             logger.error(f"Failed to stop plugin: {e}", exc_info=True)
             self._record_error(e, source="on_stop")
+
+        release_cuda_ipc()
 
         with self._lifecycle:
             self.plugin._is_running = False
