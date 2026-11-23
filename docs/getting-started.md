@@ -110,9 +110,9 @@ imports the application module in child processes.
 The examples are Python modules, so run them from the repository root:
 
 ```bash
-python -m examples.example_count
-python -m examples.example_pubsub
-python -m examples.example_configuration
+python -m examples.example_quickstart
+python -m examples.example_tensor_pipeline
+python -m examples.example_live_config
 ```
 
 See [Examples and usage patterns](examples.md) for the complete catalog.
