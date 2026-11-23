@@ -324,7 +324,13 @@ class PluginCoreRPC:
 
             with self._commands_condition:
                 if not self._accepting_commands:
-                    raise RuntimeError("RPC endpoint is stopping")
+                    logger.debug(
+                        "Rejecting command '%s' for plugin '%s': RPC endpoint is stopping",
+                        cmd,
+                        self.plugin_id,
+                    )
+                    self.respond(req, error="RPC endpoint is stopping")
+                    return
                 self._active_commands[cmd] = self._active_commands.get(cmd, 0) + 1
 
             try:
