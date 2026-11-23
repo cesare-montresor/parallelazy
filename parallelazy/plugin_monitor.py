@@ -4,9 +4,10 @@ from dataclasses import dataclass
 import os
 import struct
 import sys
+import tempfile
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,7 @@ class PipelineMonitor:
         adapter: MonitoringAdapter,
         sample_interval: float = 1.0,
         logger=None,
+        report_file: Optional[Union[str, os.PathLike]] = None,
     ):
         if isinstance(sample_interval, bool) or not isinstance(sample_interval, (int, float)):
             raise TypeError("sample_interval must be a number")
@@ -135,6 +137,10 @@ class PipelineMonitor:
         self._hotkey_thread: Optional[threading.Thread] = None
         self._hotkey_stop: Optional[threading.Event] = None
         self._terminal_settings = None
+        self._report_file_lock = threading.Lock()
+        self._report_file: Optional[str] = None
+        if report_file is not None:
+            self._report_file = self._normalize_report_file(report_file)
 
         self._psutil = None
         self._psutil_status = CapabilityAvailability(
@@ -181,14 +187,21 @@ class PipelineMonitor:
             self._thread.join(timeout=timeout)
         self._thread = None
         self.stop_hotkey()
+        self.stop_report_file()
 
     def _sampling_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                self.sample()
+                snapshot = self.sample()
             except Exception as exc:
                 if self.logger is not None:
                     self.logger.debug("Monitoring sample failed: %s", exc)
+            else:
+                try:
+                    self._write_report_file(snapshot)
+                except Exception as exc:
+                    if self.logger is not None:
+                        self.logger.debug("Monitoring report file write failed: %s", exc)
             self._stop_event.wait(self.sample_interval)
 
     def sample(self) -> MonitoringSnapshot:
@@ -488,9 +501,13 @@ class PipelineMonitor:
         del wall_now
         return metrics
 
-    def print_report(self, snapshot: Optional[MonitoringSnapshot] = None) -> None:
+    def format_report(self, snapshot: Optional[MonitoringSnapshot] = None) -> str:
         snapshot = snapshot or self.get_snapshot()
-        lines = ["Parallelazy pipeline monitor", ""]
+        updated_at = time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.localtime(snapshot.sampled_at),
+        )
+        lines = [f"Parallelazy pipeline monitor (updated {updated_at})", ""]
 
         topic_rows = []
         for metric in snapshot.topics:
@@ -617,7 +634,73 @@ class PipelineMonitor:
                     notice += " Enable with: %s" % capability.install_command
                 lines.append(notice)
 
-        print("\n".join(lines), flush=True)
+        return "\n".join(lines)
+
+    def print_report(self, snapshot: Optional[MonitoringSnapshot] = None) -> None:
+        print(self.format_report(snapshot), flush=True)
+
+    @staticmethod
+    def _normalize_report_file(path: Union[str, os.PathLike]) -> str:
+        try:
+            normalized = os.fspath(path)
+        except TypeError as exc:
+            raise TypeError("report_file must be a path-like string") from exc
+        if not isinstance(normalized, str) or not normalized.strip():
+            raise ValueError("report_file must be a non-empty path")
+        return os.path.abspath(normalized)
+
+    def start_report_file(self, path: Union[str, os.PathLike]) -> str:
+        normalized = self._normalize_report_file(path)
+        with self._report_file_lock:
+            self._report_file = normalized
+        self._write_report_file(self.get_snapshot())
+        return normalized
+
+    def stop_report_file(self) -> None:
+        with self._report_file_lock:
+            self._report_file = None
+
+    @property
+    def report_file(self) -> Optional[str]:
+        with self._report_file_lock:
+            return self._report_file
+
+    def _write_report_file(self, snapshot: MonitoringSnapshot) -> bool:
+        with self._report_file_lock:
+            target = self._report_file
+            if target is None:
+                return False
+            content = self.format_report(snapshot) + "\n"
+            parent = os.path.dirname(target) or "."
+            os.makedirs(parent, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".parallelazy-monitor-",
+                suffix=".tmp",
+                dir=parent,
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(content)
+                self._replace_report_file(tmp_path, target)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+            return True
+
+    @staticmethod
+    def _replace_report_file(tmp_path: str, target: str) -> None:
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            try:
+                os.replace(tmp_path, target)
+                return
+            except PermissionError:
+                if attempt == max_attempts - 1:
+                    raise
+                time.sleep(0.02)
 
     @staticmethod
     def _format_table(
@@ -665,10 +748,15 @@ class PipelineMonitor:
     def start_hotkey(self, key: str = "m") -> bool:
         if len(key) != 1:
             raise ValueError("hotkey must be one character")
-        if not sys.stdin.isatty():
+        if not sys.stdin or not sys.stdin.isatty():
             return False
 
         self.stop_hotkey()
+        if sys.platform == "win32":
+            return self._start_hotkey_windows(key)
+        return self._start_hotkey_posix(key)
+
+    def _start_hotkey_posix(self, key: str) -> bool:
         try:
             import termios
             import tty
@@ -700,6 +788,47 @@ class PipelineMonitor:
                 except Exception:
                     break
                 if not char:
+                    break
+                if char == key:
+                    self.print_report()
+
+        self._hotkey_thread = threading.Thread(
+            target=listen,
+            name="parallelazy-monitor-hotkey",
+            daemon=True,
+        )
+        self._hotkey_thread.start()
+        return True
+
+    def _start_hotkey_windows(self, key: str) -> bool:
+        try:
+            import _thread
+            import msvcrt
+        except ImportError:
+            return False
+
+        stop_event = threading.Event()
+        self._hotkey_stop = stop_event
+
+        def listen():
+            while not stop_event.is_set():
+                try:
+                    if not msvcrt.kbhit():
+                        stop_event.wait(0.05)
+                        continue
+                    char = msvcrt.getwch()
+                except Exception:
+                    break
+                if char in ("\x00", "\xe0"):
+                    # Discard extended key scan code (arrows, function keys)
+                    try:
+                        if msvcrt.kbhit():
+                            msvcrt.getwch()
+                    except Exception:
+                        break
+                    continue
+                if char == "\x03":
+                    _thread.interrupt_main()
                     break
                 if char == key:
                     self.print_report()

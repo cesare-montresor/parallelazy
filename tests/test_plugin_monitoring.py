@@ -1,11 +1,12 @@
 import io
 import os
 import sys
+import tempfile
 import time
 import threading
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
 from parallelazy.environment_manager import EnvironmentManager
@@ -270,6 +271,137 @@ class PluginMonitoringTests(unittest.TestCase):
         )
         self.assertFalse(capability.available)
         self.assertEqual(capability.install_command, "pip install psutil")
+
+    def test_report_file_writes_atomically_and_can_be_toggled(self):
+        manager = PluginManager.__new__(PluginManager)
+        manager._monitor_lock = threading.Lock()
+        manager._plugins_lock = threading.Lock()
+        manager._topic_publishers = {}
+        manager._topic_subscribers = {}
+        manager._env_subscribers = {}
+        manager._env = EnvironmentManager()
+        manager._plugins = {}
+        manager._monitor = None
+        manager.logger = Mock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = os.path.join(tmpdir, "nested", "monitor.txt")
+            try:
+                resolved = manager.enable_report_file(report_path)
+                self.assertEqual(resolved, os.path.abspath(report_path))
+                self.assertTrue(os.path.isfile(report_path))
+
+                with open(report_path, "r", encoding="utf-8") as handle:
+                    initial = handle.read()
+                self.assertIn("Parallelazy pipeline monitor", initial)
+                self.assertIn("Topics:", initial)
+
+                manager._env.set("stage", "updated")
+                deadline = time.monotonic() + 2.0
+                latest = initial
+                while time.monotonic() < deadline:
+                    with open(report_path, "r", encoding="utf-8") as handle:
+                        latest = handle.read()
+                    if "stage" in latest:
+                        break
+                    time.sleep(0.05)
+                self.assertIn("stage", latest)
+
+                # No temp files left behind after atomic replace
+                entries = os.listdir(os.path.dirname(report_path))
+                self.assertEqual(entries, ["monitor.txt"])
+
+                manager.disable_report_file()
+                self.assertIsNone(manager._monitor.report_file)
+
+                # After disabling file output, existing file stays on disk and is no longer overwritten
+                with open(report_path, "w", encoding="utf-8") as handle:
+                    handle.write("sentinel")
+                manager._monitor.sample()
+                time.sleep(0.05)
+                with open(report_path, "r", encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "sentinel")
+            finally:
+                manager.disable_monitoring()
+
+    def test_enable_monitoring_supports_report_file_switch(self):
+        manager = PluginManager.__new__(PluginManager)
+        manager._monitor_lock = threading.Lock()
+        manager._plugins_lock = threading.Lock()
+        manager._topic_publishers = {}
+        manager._topic_subscribers = {}
+        manager._env_subscribers = {}
+        manager._env = EnvironmentManager()
+        manager._plugins = {}
+        manager._monitor = None
+        manager.logger = Mock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = os.path.join(tmpdir, "live.txt")
+            try:
+                monitor = manager.enable_monitoring(
+                    sample_interval=0.05,
+                    report_file=report_path,
+                    report_hotkey=False,
+                )
+                self.assertEqual(monitor.report_file, os.path.abspath(report_path))
+                self.assertTrue(os.path.isfile(report_path))
+            finally:
+                manager.disable_monitoring()
+
+    def test_report_file_rejects_invalid_paths(self):
+        monitor = PipelineMonitor(MonitoringAdapter(_FakeManager()))
+        with self.assertRaises(ValueError):
+            monitor.start_report_file("")
+        with self.assertRaises(TypeError):
+            monitor.start_report_file(123)  # type: ignore[arg-type]
+
+    def test_report_file_retries_transient_permission_error_on_replace(self):
+        monitor = PipelineMonitor(MonitoringAdapter(_FakeManager()))
+        real_replace = os.replace
+        calls = {"count": 0}
+
+        def flaky_replace(src, dst):
+            calls["count"] += 1
+            if calls["count"] < 3:
+                raise PermissionError("file busy")
+            return real_replace(src, dst)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = os.path.join(tmpdir, "monitor.txt")
+            with patch("parallelazy.plugin_monitor.os.replace", side_effect=flaky_replace):
+                monitor.start_report_file(report_path)
+            self.assertEqual(calls["count"], 3)
+            self.assertTrue(os.path.isfile(report_path))
+
+    def test_start_hotkey_returns_false_when_stdin_is_none(self):
+        monitor = PipelineMonitor(MonitoringAdapter(_FakeManager()))
+        with patch.object(sys, "stdin", None):
+            self.assertFalse(monitor.start_hotkey("m"))
+
+    def test_windows_hotkey_handles_extended_keys_hotkey_and_ctrl_c(self):
+        monitor = PipelineMonitor(MonitoringAdapter(_FakeManager()))
+        printed = threading.Event()
+        interrupted = threading.Event()
+        keys = ["\xe0", "m", "x", "m", "\x03"]
+
+        fake_msvcrt = SimpleNamespace(
+            kbhit=lambda: bool(keys),
+            getwch=lambda: keys.pop(0),
+        )
+        fake_thread_mod = SimpleNamespace(
+            interrupt_main=lambda: interrupted.set(),
+        )
+        monitor.print_report = Mock(side_effect=lambda: printed.set())
+
+        with patch.dict(sys.modules, {"msvcrt": fake_msvcrt, "_thread": fake_thread_mod}):
+            self.assertTrue(monitor._start_hotkey_windows("m"))
+            self.assertTrue(printed.wait(timeout=1.0))
+            self.assertTrue(interrupted.wait(timeout=1.0))
+            monitor.stop_hotkey()
+
+        # Extended key sequence ("\xe0", "m") was ignored; only the standalone "m" printed
+        self.assertEqual(monitor.print_report.call_count, 1)
 
 
 if __name__ == "__main__":

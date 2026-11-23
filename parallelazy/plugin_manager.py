@@ -15,7 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue as WorkQueue
 from multiprocessing.sharedctypes import Synchronized
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from parallelazy.utils import is_debugpy_attached, process_start_spawn, setup_worker_debugging_env
 from parallelazy.plugin import PluginDescriptor
@@ -829,6 +829,8 @@ class PluginManager:
     def enable_monitoring(
         self,
         sample_interval: float = 1.0,
+        report_file: Optional[Union[str, os.PathLike]] = None,
+        report_hotkey: Optional[Union[bool, str]] = None,
     ):
         """Enable optional, read-only pipeline monitoring."""
         from parallelazy.plugin_monitor import MonitoringAdapter, PipelineMonitor
@@ -837,21 +839,35 @@ class PluginManager:
             raise TypeError("sample_interval must be a number")
         if sample_interval <= 0:
             raise ValueError("sample_interval must be greater than zero")
+        if report_hotkey is not None and not isinstance(report_hotkey, (bool, str)):
+            raise TypeError("report_hotkey must be a bool, a one-character string, or None")
 
+        created = False
         with self._monitor_lock:
             if self._monitor is not None:
-                self._monitor.start()
-                return self._monitor
+                monitor = self._monitor
+            else:
+                monitor = PipelineMonitor(
+                    MonitoringAdapter(self),
+                    sample_interval=sample_interval,
+                    logger=self.logger,
+                )
+                self._monitor = monitor
+                created = True
 
-            monitor = PipelineMonitor(
-                MonitoringAdapter(self),
-                sample_interval=sample_interval,
-                logger=self.logger,
-            )
-            self._monitor = monitor
-
-        self._env.begin_monitoring()
+        if created:
+            self._env.begin_monitoring()
         monitor.start()
+
+        if report_file is not None:
+            monitor.start_report_file(report_file)
+        if report_hotkey is True:
+            monitor.start_hotkey("m")
+        elif isinstance(report_hotkey, str):
+            monitor.start_hotkey(report_hotkey)
+        elif report_hotkey is False:
+            monitor.stop_hotkey()
+
         return monitor
 
     def disable_monitoring(self) -> None:
@@ -899,7 +915,8 @@ class PluginManager:
 
     def enable_report_hotkey(self, key: str = "m") -> bool:
         """Enable a hotkey that prints monitoring reports in an interactive TTY."""
-        monitor = self._monitor
+        with self._monitor_lock:
+            monitor = self._monitor
         if monitor is None:
             monitor = self.enable_monitoring()
         return monitor.start_hotkey(key)
@@ -910,6 +927,21 @@ class PluginManager:
             monitor = self._monitor
         if monitor is not None:
             monitor.stop_hotkey()
+
+    def enable_report_file(self, path: Union[str, os.PathLike]) -> str:
+        """Enable writing monitoring reports to a file on each sample."""
+        with self._monitor_lock:
+            monitor = self._monitor
+        if monitor is None:
+            monitor = self.enable_monitoring()
+        return monitor.start_report_file(path)
+
+    def disable_report_file(self) -> None:
+        """Stop updating the monitoring report file."""
+        with self._monitor_lock:
+            monitor = self._monitor
+        if monitor is not None:
+            monitor.stop_report_file()
     
     
     

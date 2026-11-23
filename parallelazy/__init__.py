@@ -76,6 +76,11 @@ from parallelazy.plugin_monitor import (
     TopicMetric,
 )
 
+from parallelazy.__main__ import (
+    get_agent_guide,
+    get_agent_guide_path,
+    install_skill,
+)
 from parallelazy.plugin_worker import PluginWorker
 
 __all__ = [
@@ -136,4 +141,7 @@ __all__ = [
     "PipelineMonitor",
     "ProcessMetric",
     "TopicMetric",
+    "get_agent_guide",
+    "get_agent_guide_path",
+    "install_skill",
 ]
