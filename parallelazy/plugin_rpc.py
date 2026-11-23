@@ -99,6 +99,11 @@ class PluginCoreRPC:
         self._executor = ThreadPoolExecutor(
             max_workers=8, thread_name_prefix=f"rpc-{plugin_id}"
         )
+        # Dedicated single-worker executor for ENV_UPDATE so rapid updates
+        # are always delivered to subscriber callbacks in strict FIFO order.
+        self._env_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"env-{plugin_id}"
+        )
 
         if start_listener:
             self.start_listener()
@@ -124,6 +129,7 @@ class PluginCoreRPC:
         # handler that's still running — the pending-request wait loop below
         # covers giving them time to complete.
         self._executor.shutdown(wait=False, cancel_futures=False)
+        self._env_executor.shutdown(wait=False, cancel_futures=False)
 
         # Step 4: Wait for pending requests to be processed (with timeout)
         timeout_start = time.time()
@@ -167,6 +173,7 @@ class PluginCoreRPC:
         if self._reader.is_alive() and threading.current_thread() is not self._reader:
             self._reader.join()
         self._executor.shutdown(wait=True, cancel_futures=False)
+        self._env_executor.shutdown(wait=True, cancel_futures=False)
         
     
     def _evict_pending(self, message_id: str) -> None:
@@ -334,7 +341,12 @@ class PluginCoreRPC:
                 self._active_commands[cmd] = self._active_commands.get(cmd, 0) + 1
 
             try:
-                self._executor.submit(self._execute_command, req)
+                executor = (
+                    self._env_executor
+                    if cmd == CommandType.ENV_UPDATE
+                    else self._executor
+                )
+                executor.submit(self._execute_command, req)
             except Exception:
                 self._command_finished(cmd)
                 raise
