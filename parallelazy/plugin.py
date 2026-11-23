@@ -45,7 +45,7 @@ class PluginDescriptor:
     Attributes:
         name: Unique plugin identifier
         version: Semantic version (e.g., "1.0.0")
-        package: Full package path (e.g., "modularnet.plugins.my_plugin")
+        package: Full package path (e.g., "parallelazy.plugins.my_plugin")
         class_name: Plugin class name in the package
         description: Human-readable description
         author: Plugin author
@@ -93,7 +93,7 @@ class PluginDescriptor:
 
 class Plugin:
     """
-    Base class for all ModularNet plugins.
+    Base class for all parallelazy plugins.
     
     Plugins run in isolated processes and communicate via:
     1. Control channel: Load/unload/configure/service commands

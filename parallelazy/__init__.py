@@ -1,5 +1,5 @@
 """
-ModularNet Plugin System: Lightweight multiprocessing-based plugin architecture.
+parallelazy Plugin System: Lightweight multiprocessing-based plugin architecture.
 
 Provides modular plugin execution with pub/sub messaging, environment variables,
 and service invocation.

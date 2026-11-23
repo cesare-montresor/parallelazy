@@ -684,13 +684,22 @@ class PipelineMonitor:
         self._hotkey_stop = stop_event
 
         def listen():
-            import termios
+            import select
 
-            fd = sys.stdin.fileno()
             while not stop_event.is_set():
+                try:
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                except Exception:
+                    break
+                if not ready:
+                    continue
+                if stop_event.is_set():
+                    break
                 try:
                     char = sys.stdin.read(1)
                 except Exception:
+                    break
+                if not char:
                     break
                 if char == key:
                     self.print_report()
@@ -707,7 +716,7 @@ class PipelineMonitor:
         if self._hotkey_stop is not None:
             self._hotkey_stop.set()
         if self._hotkey_thread is not None:
-            self._hotkey_thread.join(timeout=0.2)
+            self._hotkey_thread.join(timeout=0.5)
         self._hotkey_thread = None
         self._hotkey_stop = None
 

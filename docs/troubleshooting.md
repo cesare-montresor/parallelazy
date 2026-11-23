@@ -36,9 +36,10 @@ broker.
 ## Environment callbacks do not arrive
 
 Subscribe with `env_subscribe(name, callback)` from the plugin, and make sure
-the writer uses the same exact key. The callback receives the new value. Use
-`env_get()` for an initial snapshot because subscribing does not itself
-replay the current value.
+the writer uses the same exact key. The callback receives the current value (or
+`None` if unset) on initial subscription, followed by each subsequent update in
+order. `env_get(name, default=...)` distinguishes an explicitly stored `None`
+from an unset key.
 
 ## RPC calls fail or time out
 

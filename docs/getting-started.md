@@ -28,6 +28,12 @@ For editable development installation:
 python -m pip install -e .
 ```
 
+To include optional monitoring dependencies (`psutil` and `nvidia-ml-py`):
+
+```bash
+python -m pip install ".[monitoring]"
+```
+
 The package metadata installs `torch` and `numpy`. Select the PyTorch
 distribution appropriate for your platform and CUDA version if your environment
 requires a custom PyTorch index.
@@ -113,16 +119,16 @@ See [Examples and usage patterns](examples.md) for the complete catalog.
 
 ## Recommended shutdown pattern
 
-For multiple plugins, stop them before unloading them. The convenience
-methods make this explicit:
+Use `PluginManager` as a context manager (or call `unload_all_plugins()` in a
+`finally` block) to ensure all workers, monitoring threads, and log handlers are
+cleaned up:
 
 ```python
-try:
+with PluginManager() as manager:
+    manager.load_plugins(descriptors)
     manager.start_all_plugins()
     # application work
-finally:
-    manager.unload_all_plugins()
 ```
 
-`unload_all_plugins()` stops running plugins and then removes their manager
-records.
+`unload_all_plugins()` stops running plugins, removes their manager records, and
+closes manager log handlers.
