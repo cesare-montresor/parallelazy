@@ -252,6 +252,7 @@ class PluginManager:
                 if descriptor.write_logs is None
                 else descriptor.write_logs
             ),
+            timeout_request=self.timeout_request,
         )
 
 
@@ -399,7 +400,7 @@ class PluginManager:
         loaded = False
         try:
             runtime_settings = self._plugin_runtime_settings(descriptor)
-            plugin_rpc = PluginRPC(plugin_id)
+            plugin_rpc = PluginRPC(plugin_id, timeout=self.timeout_request)
             self._init_plugin_rpc(plugin_rpc)
             worker_channel = plugin_rpc.channel.remote_descriptor()  # For worker to manager communication
             initialized = mp.Event()
@@ -434,6 +435,7 @@ class PluginManager:
                 self._plugins[plugin_id] = plugin_info
             
             process.start()
+            plugin_rpc.channel.close_remote()
             is_ready = self._wait_for_worker_ready(
                 plugin_id,
                 process,

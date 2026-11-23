@@ -20,7 +20,7 @@ class MessageUID:
     """Thread-safe unique ID generator."""
     def __init__(self, minimal=True):
         self._counter = itertools.count()
-        self._lock = mp.Lock()
+        self._lock = threading.Lock()
         self.minimal = minimal
         self._last = 0
     
@@ -52,7 +52,14 @@ class PluginCoreRPC:
     """
 
     
-    def __init__(self, plugin_id: str, channel: Channel=None, timeout: float = 5.0, start_listener: bool = True):
+    def __init__(
+        self,
+        plugin_id: str,
+        channel: Channel = None,
+        timeout: float = 5.0,
+        start_listener: bool = True,
+        on_disconnect: Optional[Callable[[], None]] = None,
+    ):
         """
         Initialize manager proxy.
         
@@ -60,6 +67,8 @@ class PluginCoreRPC:
             plugin_id: Plugin instance identifier
             channel: Bidirectional channel for communication with manager
             timeout: Request timeout in seconds
+            start_listener: Whether to start the background channel listener thread
+            on_disconnect: Optional callback invoked when the peer disconnects unexpectedly
         """
         self.plugin_id = plugin_id
         self.channel = channel if channel is not None else Channel()
@@ -69,9 +78,11 @@ class PluginCoreRPC:
 
         self.uid = MessageUID()
         self._running = True
+        self._disconnected = False
+        self._on_disconnect = on_disconnect
         self._shutdown = Queue()
 
-        # Request/response routing: cmd_id → Queue(maxsize=1)
+        # Request/response routing: cmd_id → PendingRequest
         self._pending: Dict[str, PendingRequest] = {}
         self._pending_lock = threading.Lock()
 
@@ -80,7 +91,7 @@ class PluginCoreRPC:
         self._active_commands: Dict[str, int] = {}
         
         # Reader thread routes Responses to reply slots
-        self._reader = threading.Thread(target=self._channel_listener, daemon=False)
+        self._reader = threading.Thread(target=self._channel_listener, daemon=True)
                 
 
         # Persistent pool for executing incoming requests — avoids spawning
@@ -119,6 +130,11 @@ class PluginCoreRPC:
         while self.has_pending_requests() and (time.time() - timeout_start) < 2.0:
             logger.debug(f"Plugin {self.plugin_id} waiting for pending requests to complete...")
             time.sleep(0.05)
+
+        self._disconnected = True
+        self._fail_pending_requests(
+            ConnectionError(f"RPC shutdown for plugin '{self.plugin_id}'")
+        )
         
         self.channel.shutdown()
 
@@ -153,14 +169,36 @@ class PluginCoreRPC:
         self._executor.shutdown(wait=True, cancel_futures=False)
         
     
-    def forward(self, req: Request, wait=True) -> Any:
+    def _evict_pending(self, message_id: str) -> None:
+        with self._pending_lock:
+            self._pending.pop(message_id, None)
+
+    def _fail_pending_requests(self, error: Any) -> None:
+        with self._pending_lock:
+            pending_items = list(self._pending.values())
+            self._pending.clear()
+        for pending in pending_items:
+            pending.set_error(error)
+
+    def _failed_request(self, error: Any, message_id: Optional[str] = None) -> PendingRequest:
+        pending = PendingRequest(message_id or self.uid.next())
+        pending.set_error(error)
+        return pending
+
+    def forward(self, req: Request, wait: bool = True, timeout: Optional[float] = None) -> Any:
         forward_req = req.copy()
         
         # Forward the call to the target plugin and wait for response
-        remote_result = self.request(forward_req)
-        if not wait: return remote_result
+        pending = self.request(forward_req)
+        if not wait:
+            return pending
         
-        remote_result = remote_result.wait()
+        effective_timeout = self.timeout if timeout is None else timeout
+        remote_result = pending.wait(timeout=effective_timeout)
+        if remote_result is None:
+            raise TimeoutError(
+                f"Timed out forwarding {req.command} to plugin '{self.plugin_id}' after {effective_timeout}s"
+            )
         if remote_result.error:
             raise Exception(f"Error on forwarding {req}: {remote_result.error}")
         return remote_result.result 
@@ -174,10 +212,29 @@ class PluginCoreRPC:
         if req.sender is None:
             req.sender = self.plugin_id
 
-        pending_request = PendingRequest(req.message_id,)
+        if not self._running or self._disconnected:
+            return self._failed_request(
+                ConnectionError(f"Peer disconnected for plugin '{self.plugin_id}'"),
+                message_id=req.message_id,
+            )
+
+        pending_request = PendingRequest(req.message_id, on_timeout=self._evict_pending)
         with self._pending_lock:
+            if not self._running or self._disconnected:
+                pending_request.set_error(
+                    ConnectionError(f"Peer disconnected for plugin '{self.plugin_id}'")
+                )
+                return pending_request
             self._pending[req.message_id] = pending_request
-        self.channel.send(req)
+
+        try:
+            self.channel.send(req)
+        except Exception as e:
+            self._evict_pending(req.message_id)
+            if isinstance(e, (EOFError, OSError, BrokenPipeError, ValueError)):
+                self._disconnected = True
+            pending_request.set_error(e)
+            return pending_request
         return pending_request
     
     def respond(self, req: Request, result: Any = None, error: str = None) -> PendingRequest:
@@ -231,8 +288,21 @@ class PluginCoreRPC:
                     self._handle_response(message)
                 else:
                     logger.error(f"Received unknown message type: {message}")
-            except OSError:
-                # Channel closed, exit cleanly
+            except (EOFError, OSError, ValueError):
+                # Channel closed or peer disconnected
+                self._disconnected = True
+                self._fail_pending_requests(
+                    ConnectionError(f"Peer disconnected for plugin '{self.plugin_id}'")
+                )
+                if self._running and self._on_disconnect is not None:
+                    try:
+                        self._on_disconnect()
+                    except Exception:
+                        logger.debug(
+                            "Error in disconnect callback for plugin '%s'",
+                            self.plugin_id,
+                            exc_info=True,
+                        )
                 break
             except Exception as e:
                 if self._running:
@@ -281,7 +351,7 @@ class PluginCoreRPC:
             pending_request = self._pending.pop(resp.message_id, None)
         
         if pending_request is None:
-            logger.error(f"Received response for unknown message_id={resp.message_id} {resp.__dict__()}")
+            logger.warning(f"Received response for unknown message_id={resp.message_id} {vars(resp)}")
             return False
         
         pending_request.set_result(resp)
@@ -340,14 +410,15 @@ class PluginLifeCycleRPC(PluginCoreRPC):
     PLUGIN_ERRORS = "plugin_errors"
     PLUGIN_CALL = "plugin_call"
     """
-    def plugin_load(self, descriptor: Any, options: Dict[str, Any] = None):
+    def plugin_load(self, descriptor: Any, options: Dict[str, Any] = None) -> PendingRequest:
         """Ask the manager to load an instance described by descriptor."""
         try:
             return self.request(RequestPluginLoad(descriptor=descriptor, options=options))
         except Exception as e:
             logger.error(f"Failed to load plugin '{descriptor}': {e}")
+            return self._failed_request(e)
 
-    def plugin_start(self, plugin_id: str = None):
+    def plugin_start(self, plugin_id: str = None) -> PendingRequest:
         """
         Start a plugin. A manager omits plugin_id when starting its worker.
         """
@@ -355,9 +426,10 @@ class PluginLifeCycleRPC(PluginCoreRPC):
             return self.request(RequestPluginStart(plugin_id=plugin_id))
         except Exception as e:
             logger.error(f"Failed to start plugin: {e}")
+            return self._failed_request(e)
     
 
-    def plugin_stop(self, plugin_id: str = None):
+    def plugin_stop(self, plugin_id: str = None) -> PendingRequest:
         """
         Stop a plugin. A manager omits plugin_id when stopping its worker.
         """
@@ -365,15 +437,17 @@ class PluginLifeCycleRPC(PluginCoreRPC):
             return self.request(RequestPluginStop(plugin_id=plugin_id))
         except Exception as e:
             logger.error(f"Failed to stop plugin: {e}")
+            return self._failed_request(e)
 
-    def plugin_unload(self, plugin_id: str):
+    def plugin_unload(self, plugin_id: str) -> PendingRequest:
         """Ask the manager to unload a plugin."""
         try:
             return self.request(RequestPluginUnload(plugin_id=plugin_id))
         except Exception as e:
             logger.error(f"Failed to unload plugin '{plugin_id}': {e}")
+            return self._failed_request(e)
         
-    def plugin_call(self, plugin_id: str, method_name: str, *args, **kwargs):
+    def plugin_call(self, plugin_id: str, method_name: str, *args, **kwargs) -> PendingRequest:
         """
         Call a method on the plugin.
         
@@ -384,20 +458,20 @@ class PluginLifeCycleRPC(PluginCoreRPC):
             **kwargs: Keyword arguments
         
         Returns:
-            Method return value
+            PendingRequest resolving to the method return value
         """
         try:
             return self.request(RequestPluginCall(plugin_id=plugin_id, method_name=method_name, args=args, kwargs=kwargs))
         except Exception as e:
             logger.error(f"Failed to call plugin method '{method_name}': {e}")
-            return None
+            return self._failed_request(e)
         
     
     # ========================================================================
     # STATUS: Query manager state
     # ========================================================================
     
-    def plugin_status(self, plugin_id: str=None) -> PendingRequest | None:
+    def plugin_status(self, plugin_id: str=None) -> PendingRequest:
         """
         Get status of another plugin.
         
@@ -405,7 +479,7 @@ class PluginLifeCycleRPC(PluginCoreRPC):
             plugin_id: Plugin identifier
         
         Returns:
-            Status dict or None if not found
+            PendingRequest resolving to status info
         """
         try:
             return self.request(RequestPluginStatus(plugin_id=plugin_id))
@@ -413,32 +487,34 @@ class PluginLifeCycleRPC(PluginCoreRPC):
             logger.debug(f"Failed to get status for {plugin_id}: {e}")
             import traceback
             logger.debug(traceback.format_exc())
+            return self._failed_request(e)
     
-    def plugin_status_all(self):
+    def plugin_status_all(self) -> PendingRequest:
         """
         List all loaded plugins and their status.
         
         Returns:
-            Dictionary of plugin_id -> status info
+            PendingRequest resolving to dictionary of plugin_id -> status info
         """
         try:
             return self.request(RequestPluginStatusAll())
         except Exception as e:
             logger.error(f"Failed to list plugins: {e}")
+            return self._failed_request(e)
 
     
-    def plugin_errors(self, plugin_id:str = None):
+    def plugin_errors(self, plugin_id:str = None) -> PendingRequest:
         """
         Get any errors from the manager or other plugins.
         
         Returns:
-            Dictionary of plugin_id -> error info
+            PendingRequest resolving to error list
         """
         try:
             return self.request(RequestPluginErrors(plugin_id=plugin_id))
         except Exception as e:
             logger.error(f"Failed to get plugin errors: {e}")
-            return {}
+            return self._failed_request(e)
 
 class PluginEnvRPC(PluginCoreRPC):
     """Convience class with plugin-specific commands pre-registered."""
@@ -447,29 +523,29 @@ class PluginEnvRPC(PluginCoreRPC):
     # ENVIRONMENT VARIABLES
     # ========================================================================
     
-    def env_get(self, var_name: str):
+    def env_get(self, var_name: str) -> PendingRequest:
         """
         Get environment variable from manager.
         
         Args:
-            key: Variable key
-            default: Default value if not found
+            var_name: Variable key
         
         Returns:
-            Variable value
+            PendingRequest resolving to variable value
         """
         try:
             return self.request(RequestEnvGet(name=var_name))
         except Exception as e:
             logger.error(f"Failed to get env variable '{var_name}': {e}")
+            return self._failed_request(e)
 
     
-    def env_set(self, var_name: str, value: Any):
+    def env_set(self, var_name: str, value: Any) -> PendingRequest:
         """
         Set environment variable in manager (notifies subscribed plugins).
         
         Args:
-            key: Variable key
+            var_name: Variable key
             value: Variable value
         """
         try:
@@ -477,21 +553,22 @@ class PluginEnvRPC(PluginCoreRPC):
             return self.request(RequestEnvSet(name=var_name, value=value))
         except Exception as e:
             logger.error(f"Failed to set env variable '{var_name}': {e}")
+            return self._failed_request(e)
     
-    def env_get_all(self):
+    def env_get_all(self) -> PendingRequest:
         """
         Get all environment variables.
         
         Returns:
-            Dictionary of all env variables
+            PendingRequest resolving to dictionary of all env variables
         """
         try:
             return self.request(RequestEnvGetAll())
         except Exception as e:
             logger.error(f"Failed to get all env variables: {e}")
-            return {}
+            return self._failed_request(e)
         
-    def env_subscribe(self, var_name: str):
+    def env_subscribe(self, var_name: str) -> PendingRequest:
         """
             Subscribe to an environment variable.
 
@@ -500,9 +577,9 @@ class PluginEnvRPC(PluginCoreRPC):
             return self.request(RequestEnvSubscribe(name=var_name))
         except Exception as e:
             logger.error(f"Failed to subscribe to env variable '{var_name}': {e}")
-            return {}
+            return self._failed_request(e)
         
-    def env_unsubscribe(self, var_name: str):
+    def env_unsubscribe(self, var_name: str) -> PendingRequest:
         """
             Unsubscribe from an environment variable.
 
@@ -511,8 +588,9 @@ class PluginEnvRPC(PluginCoreRPC):
             return self.request(RequestEnvUnsubscribe(name=var_name))
         except Exception as e:
             logger.error(f"Failed to unsubscribe from env variable '{var_name}': {e}")
+            return self._failed_request(e)
 
-    def env_update(self, var_name: str, value: Any = None) :
+    def env_update(self, var_name: str, value: Any = None) -> PendingRequest:
         """
             Update an environment variable.
 
@@ -521,13 +599,14 @@ class PluginEnvRPC(PluginCoreRPC):
             return self.request(RequestEnvUpdate(name=var_name, value=value))
         except Exception as e:
             logger.error(f"Failed to notify update env variable '{var_name}': {e}")
+            return self._failed_request(e)
 
 class PluginTopicRPC(PluginCoreRPC):
     # ========================================================================
     # PUB/SUB: Publishing
     # ========================================================================
     
-    def topic_announce(self, topic: str):
+    def topic_announce(self, topic: str) -> PendingRequest:
         """
         Announce a topic.
         
@@ -538,43 +617,45 @@ class PluginTopicRPC(PluginCoreRPC):
             return self.request(RequestTopicAnnounce(topic=topic))
         except Exception as e:
             logger.error(f"Failed to announce topic '{topic}': {e}")
+            return self._failed_request(e)
 
-    def topic_subscribe(self, subscriber: Subscriber):
+    def topic_subscribe(self, subscriber: Subscriber) -> PendingRequest:
         """
         Subscribe to a topic.
         
         Args:
-            topic: Topic name
-            callback: Function to call when a message is received
+            subscriber: Subscriber descriptor
         """
         try:
             return self.request(RequestTopicSubscribe(subscriber=subscriber))
         except Exception as e:
             logger.error(f"Failed to subscribe to '{subscriber}': {e}")
+            return self._failed_request(e)
 
-    def topic_unsubscribe(self, subscriber: Subscriber):
+    def topic_unsubscribe(self, subscriber: Subscriber) -> PendingRequest:
         """
         Unsubscribe from a topic.
         
         Args:
-            topic: Topic name
-            callback: Function to remove from subscribers
+            subscriber: Subscriber descriptor
         """
         try:
             return self.request(RequestTopicUnsubscribe(subscriber=subscriber))
         except Exception as e:
             logger.error(f"Failed to unsubscribe from '{subscriber}': {e}")
+            return self._failed_request(e)
 
-    def topic_list(self, plugin_id: str=None):
+    def topic_list(self, plugin_id: str=None) -> PendingRequest:
         """
         List all published topics.
         Returns:
-            List of topic names
+            PendingRequest resolving to list of topic names
         """
         try:
             return self.request(RequestTopicList(plugin_id=plugin_id))
         except Exception as e:
             logger.error(f"Failed to list topics: {e}")
+            return self._failed_request(e)
         
 class PluginRPC(PluginLifeCycleRPC, PluginEnvRPC, PluginTopicRPC):
     """Convience class with all command categories pre-registered."""

@@ -26,6 +26,7 @@ class PluginRuntimeSettings:
     log_level: int
     display_logs: bool
     write_logs: bool = True
+    timeout_request: float = 5.0
 
 
 def resolve_directory(path: str, base_dir: Optional[str] = None) -> str:

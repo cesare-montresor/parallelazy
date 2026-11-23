@@ -167,15 +167,21 @@ class Channel:
         """Receive a message, blocking until one arrives or the pipe closes."""
         return self._receive.get()
 
+    def close_remote(self) -> None:
+        """Close the remote pipe ends after handing them to the child process."""
+        if self._remote_send is not None:
+            self._remote_send.close()
+            self._remote_send = None
+        if self._remote_receive is not None:
+            self._remote_receive.close()
+            self._remote_receive = None
+
     def shutdown(self):
         if self._send:
             self._send.close()
         if self._receive:
             self._receive.close()
-        if self._remote_send:
-            self._remote_send.close()
-        if self._remote_receive:
-            self._remote_receive.close()
+        self.close_remote()
 
 
 # ============================================================================
@@ -266,10 +272,16 @@ class Response(Message):
     error: Optional[str] = None
 
 class PendingRequest():
-    def __init__(self, message_id: str, callback: Callable=None):
+    def __init__(
+        self,
+        message_id: str,
+        callback: Callable = None,
+        on_timeout: Optional[Callable[[str], None]] = None,
+    ):
         super().__init__()
         self.future = Future()
         self.message_id = message_id
+        self._on_timeout = on_timeout
         if callback:
             self.future.add_done_callback(callback)
 
@@ -279,16 +291,26 @@ class PendingRequest():
     def set_result(self, result: Response|Any):
         if not isinstance(result, Response):
             result = Response(message_id=self.message_id, result=result)
-        self.future.set_result(result)
+        if not self.future.done():
+            try:
+                self.future.set_result(result)
+            except Exception:
+                pass
 
     def set_error(self, error: str|Exception|Any):
-        self.future.set_result(Response(message_id=self.message_id, error=str(error)))
+        if not self.future.done():
+            try:
+                self.future.set_result(Response(message_id=self.message_id, error=str(error)))
+            except Exception:
+                pass
 
     def wait(self, timeout=None) -> None | Response:
         try:
             result: Response = self.future.result(timeout=timeout)
             return result
         except TimeoutError:
+            if self._on_timeout is not None:
+                self._on_timeout(self.message_id)
             return None
         
     def __hash__(self):
