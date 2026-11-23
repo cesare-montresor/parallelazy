@@ -303,8 +303,8 @@ class PipelineMonitor:
         try:
             import fcntl
             descriptor = subscriber.queue_descriptor
-            connection = descriptor.receive
-            if connection.closed:
+            connection = descriptor.send if descriptor.send is not None else descriptor.receive
+            if connection is None or connection.closed:
                 return None
             pending = struct.pack("I", 0)
             result = fcntl.ioctl(connection.fileno(), 0x541B, pending, True)

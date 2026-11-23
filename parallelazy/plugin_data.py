@@ -52,13 +52,30 @@ ResponseCallback = Callable[["PluginRPC","Response"], Any]
 
 
 
+class _TopicShutdownSentinel:
+    """Private sentinel used to stop topic listener threads cleanly."""
+    pass
+
+
+_TOPIC_SHUTDOWN_SENTINEL = _TopicShutdownSentinel()
+
+
 class QueueDescriptor:
-    """Descriptor for holding 2 connections, read/write repesenting a queue made with pipes."""
-    def __init__(self, send: Connection, recieve: Connection):
+    """Descriptor for holding read/write connections representing a pipe-backed queue."""
+    def __init__(
+        self,
+        send: Optional[Connection] = None,
+        receive: Optional[Connection] = None,
+        *,
+        recieve: Optional[Connection] = None,
+    ):
         self.send = send
-        self.receive = recieve
+        self.receive = receive if receive is not None else recieve
     
-    def __str__(self): return f"QueueDescriptor(send_closed={self.send.closed()}, receive_closed={self.receive.closed()})"
+    def __str__(self):
+        send_closed = self.send.closed if self.send is not None else None
+        receive_closed = self.receive.closed if self.receive is not None else None
+        return f"QueueDescriptor(send_closed={send_closed}, receive_closed={receive_closed})"
         
 
 
@@ -70,11 +87,11 @@ class Queue:
     def __init__(self, descriptor: QueueDescriptor = None):
         if descriptor is None:
             receive, send = mp.Pipe(duplex=False)
+            self._send = QueueSend(send)
+            self._receive = QueueRecive(receive)
         else:
-            receive, send = descriptor.receive, descriptor.send
-
-        self._send = QueueSend(send)
-        self._receive = QueueRecive(receive)
+            self._send = QueueSend(descriptor.send) if descriptor.send is not None else None
+            self._receive = QueueRecive(descriptor.receive) if descriptor.receive is not None else None
 
     @property
     def sender(self):
@@ -85,27 +102,62 @@ class Queue:
         return self._receive
     
     def closed(self):
-        return self._send._conn.closed or self._receive._conn.closed
+        send_closed = self._send._conn.closed if self._send is not None else True
+        recv_closed = self._receive._conn.closed if self._receive is not None else True
+        if self._send is not None and self._receive is not None:
+            return send_closed or recv_closed
+        return send_closed and recv_closed
     
     def put(self, item):
+        if self._send is None:
+            raise ValueError("Queue has no send end")
         self._send.put(item)
 
     def put_nowait(self, item):
-        self._send.put(item)
+        self.put(item)
+
+    def send_bytes(self, data: bytes):
+        if self._send is None:
+            raise ValueError("Queue has no send end")
+        self._send.send_bytes(data)
     
     def get(self):
+        if self._receive is None:
+            raise ValueError("Queue has no receive end")
         return self._receive.get()
     
     def get_nowait(self):
-        return self._receive.get()
+        return self.get()
+
+    def close_sender(self):
+        if self._send is not None:
+            try:
+                self._send.close()
+            except Exception:
+                pass
+            self._send = None
 
     def close(self):
-        self._send.put(None)  # Send a sentinel to indicate closure
-        self._send.close()
-        self._receive.close()
+        self.close_sender()
+        if self._receive is not None:
+            try:
+                self._receive.close()
+            except Exception:
+                pass
+            self._receive = None
 
     def descriptor(self):
-        return QueueDescriptor(self._send._conn, self._receive._conn)
+        return QueueDescriptor(
+            send=self._send._conn if self._send is not None else None,
+            receive=self._receive._conn if self._receive is not None else None,
+        )
+
+    def send_descriptor(self):
+        """Return a descriptor containing only the write end of the pipe."""
+        return QueueDescriptor(
+            send=self._send._conn if self._send is not None else None,
+            receive=None,
+        )
 
 
 class QueueSend:
@@ -116,6 +168,10 @@ class QueueSend:
     def put(self, item):
         with self._lock:
             self._conn.send(item)
+
+    def send_bytes(self, data: bytes):
+        with self._lock:
+            self._conn.send_bytes(data)
 
     def close(self):
         self._conn.close()
@@ -326,6 +382,35 @@ class Subscription:
         self.callback = callback
         self.queue = queue or Queue()  # For topic subscriptions, queue to receive data
         self.thread: Optional[threading.Thread] = thread  # Thread handling this subscription (if needed)
+        self._wakeup_r, self._wakeup_w = mp.Pipe(duplex=False)
+        self._wakeup_lock = threading.Lock()
+        self._stopped = False
+
+    def signal_stop(self) -> None:
+        """Wake the listener thread without writing to the topic data pipe."""
+        with self._wakeup_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            try:
+                if not self._wakeup_w.closed:
+                    self._wakeup_w.send_bytes(b"1")
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        """Signal stop and close both wakeup and topic pipe handles."""
+        self.signal_stop()
+        try:
+            self.queue.close()
+        except Exception:
+            pass
+        for conn in (self._wakeup_w, self._wakeup_r):
+            try:
+                if not conn.closed:
+                    conn.close()
+            except Exception:
+                pass
 
 class Subscriber:
     """Represents a subscriber to a topic or environment variable."""
@@ -344,6 +429,21 @@ class Subscriber:
     @queue.setter
     def queue(self, value: Queue):
         self._queue = value
+
+    def close(self) -> None:
+        if self._queue is not None:
+            try:
+                self._queue.close()
+            except Exception:
+                pass
+        elif self.queue_descriptor is not None:
+            for conn in (self.queue_descriptor.send, self.queue_descriptor.receive):
+                if conn is not None:
+                    try:
+                        if not conn.closed:
+                            conn.close()
+                    except Exception:
+                        pass
     
 
     def __str__(self):

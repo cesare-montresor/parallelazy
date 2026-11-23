@@ -13,13 +13,32 @@ Command dispatch:
 
 import logging
 import importlib
-from queue import Full
 import threading
+from multiprocessing.connection import wait as conn_wait
+from multiprocessing.reduction import ForkingPickler
 from multiprocessing.sharedctypes import Synchronized
-
+import torch
 
 from parallelazy.utils import init_debugger, is_debugging_enabled
-from parallelazy.plugin_data import  Channel, CommandType, PluginStartupPhase, ProcessStatus, Queue,QueueDescriptor, PendingRequest, PluginStatus,  RequestPluginErrors, RequestPluginStart, RequestPluginStatus, RequestPluginStop, RequestTopicList, Subscriber, Subscription
+from parallelazy.plugin_data import (
+    Channel,
+    CommandType,
+    PluginStartupPhase,
+    ProcessStatus,
+    Queue,
+    QueueDescriptor,
+    PendingRequest,
+    PluginStatus,
+    RequestPluginErrors,
+    RequestPluginStart,
+    RequestPluginStatus,
+    RequestPluginStop,
+    RequestTopicList,
+    Subscriber,
+    Subscription,
+    _TOPIC_SHUTDOWN_SENTINEL,
+    _TopicShutdownSentinel,
+)
 from parallelazy.plugin import Plugin, PluginDescriptor, PluginState
 from parallelazy.plugin_logging import (
     LoggingSession,
@@ -47,6 +66,71 @@ def _set_startup_phase(
 ) -> None:
     if startup_phase is not None:
         startup_phase.value = int(phase)
+
+
+def _contains_torch_tensor(obj: Any, _seen: Optional[set] = None) -> bool:
+    if isinstance(obj, torch.Tensor):
+        return True
+    if isinstance(obj, (str, bytes, int, float, bool, type(None))):
+        return False
+    if _seen is None:
+        _seen = set()
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return False
+    if isinstance(obj, dict):
+        _seen.add(obj_id)
+        return any(
+            _contains_torch_tensor(k, _seen) or _contains_torch_tensor(v, _seen)
+            for k, v in obj.items()
+        )
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        _seen.add(obj_id)
+        return any(_contains_torch_tensor(item, _seen) for item in obj)
+    return False
+
+
+def _deliver_to_subscribers(
+    topic: str,
+    data: Any,
+    subscribers: list,
+    log: logging.Logger,
+) -> tuple[int, list[str]]:
+    """Fan out a payload to subscribers, isolating failures and reporting dead IDs."""
+    payload_bytes = None
+    if len(subscribers) > 1 and not _contains_torch_tensor(data):
+        try:
+            payload_bytes = bytes(ForkingPickler.dumps(data))
+        except Exception:
+            payload_bytes = None
+
+    delivered = 0
+    dead_ids: list[str] = []
+    for sub_id, subscriber in subscribers:
+        try:
+            if payload_bytes is not None:
+                subscriber.queue.send_bytes(payload_bytes)
+            else:
+                subscriber.queue.put(data)
+            delivered += 1
+        except (BrokenPipeError, EOFError, OSError, ValueError) as e:
+            log.warning(
+                "Subscriber '%s' on topic '%s' is unavailable (%s); evicting",
+                sub_id,
+                topic,
+                e,
+            )
+            dead_ids.append(sub_id)
+            subscriber.close()
+        except Exception as e:
+            log.error(
+                "Failed to publish to subscriber '%s' on topic '%s': %s",
+                sub_id,
+                topic,
+                e,
+                exc_info=True,
+            )
+    return delivered, dead_ids
 
 
 # ============================================================================
@@ -291,9 +375,12 @@ class PluginWorker:
     def _wake_topic_listeners(self) -> None:
         for topic, subscription in list(self.topic_subscriptions.items()):
             try:
-                subscription.queue.put(None)
+                if hasattr(subscription, "signal_stop"):
+                    subscription.signal_stop()
+                else:
+                    subscription.queue.put(_TOPIC_SHUTDOWN_SENTINEL)
             except Exception as e:
-                logger.error(f"Error closing queue for topic '{topic}': {e}")
+                logger.error(f"Error waking topic listener for '{topic}': {e}")
 
     def start(self) -> bool:
         """Start the plugin once; the worker's main thread invokes plugin.main()."""
@@ -743,19 +830,21 @@ class PluginWorker:
         """Subscribe to a topic."""
         subscription = Subscription(topic, callback)
 
-        desc = subscription.queue.descriptor()
+        desc = subscription.queue.send_descriptor()
         subscriber = Subscriber(self.plugin_id, topic, desc)
 
         pending: PendingRequest = self.rpc.topic_subscribe(subscriber)
-        subscriber.queue = Queue(desc)
+        subscription.queue.close_sender()
         effective_timeout = self._resolve_timeout(timeout)
         response = pending.wait(timeout=effective_timeout)
         if response is None:
+            subscription.close()
             msg = f"Timed out subscribing to topic '{topic}' after {effective_timeout}s"
             logger.error(msg)
             self.error_log.append(msg)
             return False
         if response.error:
+            subscription.close()
             logger.error(f"Error subscribing to topic '{topic}': {response.error}")
             self.error_log.append(str(response.error))
             return False
@@ -763,6 +852,8 @@ class PluginWorker:
             subscription.thread = threading.Thread(target=self._topic_listener, args=(topic,), daemon=True)
             self.topic_subscriptions[topic] = subscription
             subscription.thread.start()
+        else:
+            subscription.close()
         return response.result
     
     def topic_unsubscribe(
@@ -775,9 +866,8 @@ class PluginWorker:
             logger.warning("Not subscribed to topic '%s'", topic)
             return True
         
-        subscription = self.topic_subscriptions[topic] 
-        desc = subscription.queue.descriptor()
-        subscriber = Subscriber(self.plugin_id, topic, desc)
+        subscription = self.topic_subscriptions[topic]
+        subscriber = Subscriber(self.plugin_id, topic, QueueDescriptor())
 
         pending: PendingRequest = self.rpc.topic_unsubscribe(subscriber)
         effective_timeout = self._resolve_timeout(timeout)
@@ -794,20 +884,22 @@ class PluginWorker:
         
         if response.result:
             del self.topic_subscriptions[topic]
-            subscription.queue.close()
-            subscription.thread.join(timeout=1.0)
-            
+            subscription.signal_stop()
+            if subscription.thread is not None and subscription.thread.is_alive():
+                subscription.thread.join(timeout=1.0)
+            subscription.close()
 
         return response.result
 
 
     def topic_list(
         self,
+        plugin_id: Optional[str] = None,
         wait: bool = True,
         timeout: Optional[float] = None,
     ) -> PendingRequest | list:
         """List available topics."""
-        pending: PendingRequest = self.rpc.topic_list()
+        pending: PendingRequest = self.rpc.topic_list(plugin_id=plugin_id)
         if not wait:
             return pending
         
@@ -852,47 +944,36 @@ class PluginWorker:
 
         manager_subscribers: Dict[str, Subscriber] = response.result
 
-
-        diff_subs = [] 
-        for sub in manager_subscribers.values():
-            if sub.plugin_id not in topic_subscribers:
-                sub.queue = Queue(sub.queue_descriptor)
-                diff_subs.append(sub)
-                topic_subscribers[sub.plugin_id] = sub
-
         with self._topic_subscribers_lock:
-            topic_subscribers.update(manager_subscribers)
+            for sub in manager_subscribers.values():
+                if sub.plugin_id not in topic_subscribers:
+                    sub.queue = Queue(sub.queue_descriptor)
+                    topic_subscribers[sub.plugin_id] = sub
 
         return True
 
-    def topic_publish(self, topic: str, data: Any) -> None:
+    def topic_publish(self, topic: str, data: Any) -> int:
         data = sanitize_for_ipc(data)
 
         self.topic_announce(topic)
         
         with self._topic_subscribers_lock:
-            topic_subscribers = dict(
-                self.topic_subscribers.get(topic, {})
-            )
-        if not topic_subscribers: return
-            
+            subscribers = list(self.topic_subscribers.get(topic, {}).items())
+        if not subscribers:
+            return 0
 
-        #print("topic_publish: topic_subscribers: ",self.topic_subscribers)
+        delivered, dead_ids = _deliver_to_subscribers(topic, data, subscribers, logger)
 
-        for subscriber in topic_subscribers.values():
-            #print("----")
+        if dead_ids:
+            with self._topic_subscribers_lock:
+                topic_subs = self.topic_subscribers.get(topic)
+                if topic_subs is not None:
+                    for sub_id in dead_ids:
+                        removed = topic_subs.pop(sub_id, None)
+                        if removed is not None:
+                            removed.close()
 
-            try:
-                subscriber.queue.put_nowait(data)
-            except Full:
-                logger.warning(f"Subscriber {subscriber.plugin_id} on topic '{topic}' is full — dropping message")
-                return False
-            except Exception as e:
-                logger.error(f"[ERROR] Failed to publish to subscriber {subscriber.plugin_id} on topic '{topic}':", exc_info=True)
-                logger.error(f"[ERROR]\n{e}\n---")
-                return False
-        
-        return True
+        return delivered
     
     
 
@@ -998,8 +1079,15 @@ class PluginWorker:
 
             # pull data from subscription queue (blocking)
             try:
-                data = registered.queue.get() # Blocking wait for new data
-                if data is None:
+                wakeup_r = getattr(registered, "_wakeup_r", None)
+                receiver = getattr(registered.queue, "receiver", None)
+                if wakeup_r is not None and receiver is not None:
+                    ready = conn_wait([receiver._conn, wakeup_r])
+                    if wakeup_r in ready:
+                        logger.info("Received shutdown signal for topic '%s'", topic)
+                        break
+                data = registered.queue.get()  # Blocking wait for new data
+                if isinstance(data, _TopicShutdownSentinel):
                     logger.info("Received shutdown sentinel for topic '%s'", topic)
                     break
             except ValueError as e:
@@ -1062,7 +1150,7 @@ class PluginWorker:
             sub = self.topic_subscribers[topic].pop(plugin_id)
         
         try:
-            sub.queue.close()
+            sub.close()
         except Exception as e:
             logger.info(f"Error closing queue for topic '{topic}': {e}", exc_info=True)
 
@@ -1070,5 +1158,5 @@ class PluginWorker:
     
     def _request_topic_list(self, rpc: PluginRPC, req: RequestTopicList) -> list:
         """Handle topic list request."""
-        return self.topic_published.copy()
+        return sorted(self.topic_published)
     

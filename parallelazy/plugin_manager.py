@@ -26,7 +26,8 @@ from parallelazy.plugin_logging import (
     resolve_directory,
 )
 from parallelazy.plugin_rpc import PluginRPC, RequestEnvGetAll, RequestEnvUnsubscribe, RequestTopicAnnounce
-from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicSubscribe, RequestTopicUnsubscribe
+from parallelazy.plugin_transport import sanitize_for_ipc
+from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe
 from parallelazy.plugin_data import  CommandType, PluginStartupPhase, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, Subscriber
 from parallelazy.environment_manager import EnvironmentManager
 
@@ -631,7 +632,9 @@ class PluginManager:
                     del self._env_subscribers[env]
 
             for topic, plugins in list(self._topic_subscribers.items()):
-                plugins.pop(plugin_id, None)
+                removed = plugins.pop(plugin_id, None)
+                if removed is not None:
+                    removed.close()
                 if not plugins:
                     del self._topic_subscribers[topic]
 
@@ -895,7 +898,7 @@ class PluginManager:
     # Service Management (Optional, for future extension)
     # ========================================================================
 
-    def topic_publish(self, topic: str, data: Any):
+    def topic_publish(self, topic: str, data: Any) -> int:
         """
         Publish data to a topic.
         
@@ -906,21 +909,41 @@ class PluginManager:
         Returns:
             Number of subscribers that received the message
         """
-        
+        data = sanitize_for_ipc(data)
         with self._plugins_lock:
-            subscribers = tuple(self._topic_subscribers.get(topic, {}).values())
+            subscribers = list(self._topic_subscribers.get(topic, {}).items())
 
-        for subscriber in subscribers:
-            try:
-                subscriber.queue.put_nowait(data)
-            except Exception as e:
-                self.logger.debug(f"Failed to deliver to topic '{topic}': {e}")
-        
-        return True
+        if not subscribers:
+            return 0
 
-    def topic_list(self) -> List[str]:
+        from parallelazy.plugin_worker import _deliver_to_subscribers
+        delivered, dead_ids = _deliver_to_subscribers(topic, data, subscribers, self.logger)
+
+        if dead_ids:
+            with self._plugins_lock:
+                topic_subs = self._topic_subscribers.get(topic)
+                if topic_subs is not None:
+                    for sub_id in dead_ids:
+                        removed = topic_subs.pop(sub_id, None)
+                        if removed is not None:
+                            removed.close()
+                    if not topic_subs:
+                        del self._topic_subscribers[topic]
+
+        return delivered
+
+    def topic_list(self, plugin_id: Optional[str] = None) -> List[str]:
         with self._plugins_lock:
-            return list(self._topic_subscribers.keys())
+            if plugin_id is None:
+                return sorted(
+                    set(self._topic_publishers.keys())
+                    | set(self._topic_subscribers.keys())
+                )
+            return sorted(
+                topic
+                for topic, pub in self._topic_publishers.items()
+                if pub == plugin_id
+            )
 
     # ========================================================================
     # PLUGIN Lifecycle
@@ -1062,85 +1085,102 @@ class PluginManager:
         Subscribe a plugin to a topic.
         Allow subscription also for non (yet, hopefully) existing topics.
         """
-        
-        sub  = req.subscriber
+        sub = req.subscriber
         topic = sub.topic
         plugin_sub = req.sender
+        forward_rpc = None
 
         with self._plugins_lock:
-            if plugin_sub not in self._plugins: return False
+            if plugin_sub not in self._plugins:
+                sub.close()
+                return False
 
-            plugin_pub = self._topic_publishers.get(topic,None)
-            if plugin_pub is not None and plugin_pub not in self._plugins: return False
+            plugin_pub = self._topic_publishers.get(topic, None)
+            if plugin_pub is not None:
+                pub_info = self._plugins.get(plugin_pub)
+                if pub_info is None:
+                    sub.close()
+                    return False
+                forward_rpc = pub_info.rpc
 
             if topic not in self._topic_subscribers:
                 self._topic_subscribers[topic] = {}
 
-            if plugin_sub not in self._topic_subscribers[topic]:
-                self._topic_subscribers[topic][plugin_sub] = sub
+            previous = self._topic_subscribers[topic].get(plugin_sub)
+            if previous is not None and previous is not sub:
+                previous.close()
+            self._topic_subscribers[topic][plugin_sub] = sub
 
         remote_result = True  # Default to success
 
-        if plugin_pub is not None:
-            forward_rpc = self._plugins[plugin_pub].rpc
-            remote_result = forward_rpc.forward(req)
-            self.logger.debug(f"topic_subscribe: {remote_result}" )
+        if forward_rpc is not None:
+            try:
+                remote_result = forward_rpc.forward(req)
+                self.logger.debug(f"topic_subscribe: {remote_result}")
+            except Exception as e:
+                self.logger.error(
+                    "Failed to forward topic_subscribe for '%s' to publisher '%s': %s",
+                    topic,
+                    plugin_pub,
+                    e,
+                )
+                remote_result = False
 
         if not remote_result:
             with self._plugins_lock:
                 subscribers = self._topic_subscribers.get(topic)
                 if subscribers is not None:
-                    subscribers.pop(plugin_sub, None)
+                    removed = subscribers.pop(plugin_sub, None)
+                    if removed is not None:
+                        removed.close()
                     if not subscribers:
                         del self._topic_subscribers[topic]
             return False
 
-
-        
         return True
 
 
     def _respond_topic_unsubscribe(self, rpc: PluginRPC, req: RequestTopicUnsubscribe) -> bool:
         """
         Unsubscribe a plugin from a topic.
-        
-        Args:
-            plugin_id: Plugin identifier
-            topic: Topic name
-        
-        Returns:
-            True if unsubscription successful
         """
-        sub  = req.subscriber
+        sub = req.subscriber
         topic = sub.topic
         src_id = sub.plugin_id
+        forward_rpc = None
 
         with self._plugins_lock:
-            if src_id not in self._plugins: return False
-            if topic not in self._topic_publishers: return True
+            if src_id not in self._plugins:
+                return False
 
-            dst_id = self._topic_publishers[topic]
-
-        forward_rpc = self._plugins[dst_id].rpc
-        remote_result = forward_rpc.forward(req)
-
-        if not remote_result: return False
-        
-
-        with self._plugins_lock:
             subscribers = self._topic_subscribers.get(topic)
             if subscribers is not None:
-                subscribers.pop(src_id, None)
+                removed = subscribers.pop(src_id, None)
+                if removed is not None:
+                    removed.close()
                 if not subscribers:
                     del self._topic_subscribers[topic]
 
+            dst_id = self._topic_publishers.get(topic)
+            if dst_id is not None and dst_id in self._plugins:
+                forward_rpc = self._plugins[dst_id].rpc
+
+        if forward_rpc is not None:
+            try:
+                remote_result = forward_rpc.forward(req)
+                return bool(remote_result)
+            except Exception as e:
+                self.logger.warning(
+                    "Failed to forward topic_unsubscribe for '%s' to publisher: %s",
+                    topic,
+                    e,
+                )
 
         return True
 
     def _respond_topic_announce(self, rpc: PluginRPC, req: RequestTopicAnnounce) -> Dict[str, Subscriber]:
         """
         Announce a new topic.
-        
         """
         with self._plugins_lock:
             self._topic_publishers[req.topic] = req.sender
@@ -1149,5 +1189,5 @@ class PluginManager:
                 self._topic_subscribers[req.topic] = {}
             return dict(self._topic_subscribers[req.topic])
 
-    def _respond_topic_list(self) -> List[str]:
-        return self.topic_list()
+    def _respond_topic_list(self, rpc: PluginRPC, req: RequestTopicList) -> List[str]:
+        return self.topic_list(plugin_id=req.plugin_id)
