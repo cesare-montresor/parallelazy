@@ -14,6 +14,7 @@ Command dispatch:
 import logging
 import importlib
 import threading
+import traceback
 from multiprocessing.connection import wait as conn_wait
 from multiprocessing.reduction import ForkingPickler
 from multiprocessing.sharedctypes import Synchronized
@@ -157,6 +158,7 @@ class PluginWorker:
         initialized: Event,
         runtime_settings: Optional[PluginRuntimeSettings] = None,
         startup_phase: Optional[Synchronized] = None,
+        init_error_conn: Any = None,
     ) -> None:
         """
         Entry point for plugin subprocess.
@@ -169,6 +171,7 @@ class PluginWorker:
             initialized: Event to signal initialization completion
             runtime_settings: Resolved paths and logging settings for this worker
             startup_phase: Shared startup phase state for manager visibility
+            init_error_conn: Optional pipe write-end to report initialization errors
         """
         _set_startup_phase(startup_phase, PluginStartupPhase.PROCESS_STARTED)
         logging_session = None
@@ -195,6 +198,12 @@ class PluginWorker:
                 logging_session=logging_session,
                 startup_phase=startup_phase,
             )
+            if init_error_conn is not None:
+                try:
+                    init_error_conn.close()
+                except Exception:
+                    pass
+                init_error_conn = None
             worker.main()
         except Exception:
             if (
@@ -202,8 +211,18 @@ class PluginWorker:
                 and startup_phase.value < PluginStartupPhase.READY
             ):
                 _set_startup_phase(startup_phase, PluginStartupPhase.FAILED)
+                if init_error_conn is not None:
+                    try:
+                        init_error_conn.send(traceback.format_exc())
+                    except Exception:
+                        pass
             raise
         finally:
+            if init_error_conn is not None:
+                try:
+                    init_error_conn.close()
+                except Exception:
+                    pass
             if output_capture is not None:
                 output_capture.close()
             if logging_session is not None:
@@ -299,6 +318,30 @@ class PluginWorker:
     # Worker Main Loop
     # ========================================================================
 
+    def _record_error(
+        self,
+        error: Exception,
+        source: str,
+        set_error_state: bool = False,
+    ) -> None:
+        """Record an error in error_log, optionally mark ERROR state, and invoke plugin.on_error."""
+        self.error_log.append(str(error))
+        plugin = getattr(self, "plugin", None)
+        if plugin is None:
+            return
+        if set_error_state:
+            plugin.state = PluginState.ERROR
+        on_error = getattr(plugin, "on_error", None)
+        if callable(on_error):
+            try:
+                on_error(error, source=source)
+            except Exception:
+                logger.error(
+                    "Error inside plugin.on_error (source=%s)",
+                    source,
+                    exc_info=True,
+                )
+
     def main(self) -> None:
         """Run plugin work on the process main thread, then await shutdown."""
         logger.info("Worker started")
@@ -325,7 +368,7 @@ class PluginWorker:
                     self._request_stop()
                 except Exception as e:
                     logger.error("Plugin error in main: %s", e, exc_info=True)
-                    self.error_log.append(str(e))
+                    self._record_error(e, source="main", set_error_state=True)
 
             self._stop_requested.wait()
             self._finish_stop()
@@ -363,6 +406,7 @@ class PluginWorker:
             self.plugin.on_stop()
         except Exception as e:
             logger.error(f"Failed to stop plugin: {e}", exc_info=True)
+            self._record_error(e, source="on_stop")
 
         with self._lifecycle:
             self.plugin._is_running = False
@@ -414,6 +458,7 @@ class PluginWorker:
             self.plugin.on_start()
         except Exception as e:
             logger.error(f"Failed to start plugin: {e}", exc_info=True)
+            self._record_error(e, source="on_start", set_error_state=True)
             with self._lifecycle:
                 self._start_in_progress = False
                 self._lifecycle.notify_all()
@@ -692,6 +737,28 @@ class PluginWorker:
             self.error_log.append(str(response.error))
             return None
         return response.result
+
+    def plugin_errors(
+        self,
+        plugin_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> list:
+        """Get recorded error messages for this plugin or another plugin."""
+        if plugin_id is None or plugin_id == self.plugin_id:
+            return list(self.error_log)
+        pending: PendingRequest = self.rpc.plugin_errors(plugin_id)
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out getting errors for plugin '{plugin_id}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return []
+        if response.error:
+            logger.error(f"Error getting plugin errors for '{plugin_id}': {response.error}")
+            self.error_log.append(str(response.error))
+            return []
+        return list(response.result or [])
 
 
     """Commands that plugin can send to manager or other plugins.
@@ -1073,7 +1140,11 @@ class PluginWorker:
         
         method = getattr(self.plugin, method_name)
         
-        result = method(*args, **kwargs)
+        try:
+            result = method(*args, **kwargs)
+        except Exception as e:
+            self._record_error(e, source=f"rpc:{method_name}")
+            raise
         result = sanitize_for_ipc(result)
 
         return result
@@ -1092,7 +1163,12 @@ class PluginWorker:
             callback = self.env_subscriptions.get(var_name)
         if callback is None:
             return True
-        self._invoke_callback(callback, req.value)
+        try:
+            self._invoke_callback(callback, req.value)
+        except Exception as e:
+            logger.error("Error in env '%s' callback: %s", var_name, e, exc_info=True)
+            self._record_error(e, source=f"env:{var_name}")
+            return False
         return True
 
     def _invoke_callback(self, callback: Callable, *args) -> None:
@@ -1175,7 +1251,7 @@ class PluginWorker:
                     e,
                     exc_info=True,
                 )
-                self.error_log.append(str(e))
+                self._record_error(e, source=f"topic:{topic}")
                 continue
     
     def _respond_topic_subscribe(self, rpc: PluginRPC, req: RequestTopicSubscribe) -> bool:

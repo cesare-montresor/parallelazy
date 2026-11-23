@@ -28,7 +28,7 @@ from parallelazy.plugin_logging import (
 from parallelazy.plugin_rpc import PluginRPC, RequestEnvGetAll, RequestEnvUnsubscribe, RequestTopicAnnounce
 from parallelazy.plugin_transport import sanitize_for_ipc
 from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe
-from parallelazy.plugin_data import  CommandType, PluginStartupPhase, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, Subscriber
+from parallelazy.plugin_data import  CommandType, PluginStartupPhase, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginErrors, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, Subscriber
 from parallelazy.environment_manager import EnvironmentManager
 
 
@@ -400,6 +400,8 @@ class PluginManager:
         plugin_rpc = None
         process = None
         plugin_info = None
+        init_error_r = None
+        init_error_w = None
         loaded = False
         try:
             runtime_settings = self._plugin_runtime_settings(descriptor)
@@ -409,6 +411,7 @@ class PluginManager:
             initialized = mp.Event()
             initialized.clear()  # Ensure not set
             startup_phase = mp.Value("i", PluginStartupPhase.NOT_STARTED)
+            init_error_r, init_error_w = mp.Pipe(duplex=False)
 
             # Spawn worker process
             process = mp.Process(
@@ -421,6 +424,7 @@ class PluginManager:
                     initialized,
                     runtime_settings,
                     startup_phase,
+                    init_error_w,
                 ),
                 name=f"plugin-{plugin_id}"
             )
@@ -439,6 +443,8 @@ class PluginManager:
             
             process.start()
             plugin_rpc.channel.close_remote()
+            init_error_w.close()
+            init_error_w = None
             is_ready = self._wait_for_worker_ready(
                 plugin_id,
                 process,
@@ -449,11 +455,25 @@ class PluginManager:
             # If the loop exited and is_ready is False, the process died before setting the event
             if not is_ready:
                 phase = PluginStartupPhase(startup_phase.value)
-                self.logger.error(
-                    "Plugin %s did not become ready (last phase=%s)",
-                    plugin_id,
-                    phase.name.lower(),
-                )
+                init_error = None
+                try:
+                    if init_error_r.poll(timeout=0.1):
+                        init_error = init_error_r.recv()
+                except Exception:
+                    init_error = None
+                if init_error:
+                    self.logger.error(
+                        "Plugin %s did not become ready (last phase=%s):\n%s",
+                        plugin_id,
+                        phase.name.lower(),
+                        init_error,
+                    )
+                else:
+                    self.logger.error(
+                        "Plugin %s did not become ready (last phase=%s)",
+                        plugin_id,
+                        phase.name.lower(),
+                    )
                 return False
 
             self.logger.info(f"Plugin {plugin_id} loaded")
@@ -464,6 +484,12 @@ class PluginManager:
             self.logger.error(f"Error loading plugin {descriptor}: {e}")
             return False
         finally:
+            for conn in (init_error_w, init_error_r):
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
             if not loaded:
                 if process is not None and process.pid is not None:
                     if process.is_alive():
@@ -749,6 +775,51 @@ class PluginManager:
         with self._plugins_lock:
             return list(self._plugins.keys())
 
+    def plugin_call(
+        self,
+        plugin_id: str,
+        method_name: str,
+        *args,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> Any:
+        """Invoke a method on a loaded plugin via RPC."""
+        with self._plugins_lock:
+            info = self._plugins.get(plugin_id)
+        if info is None:
+            raise ValueError(f"Plugin {plugin_id} not found")
+
+        effective_timeout = self.timeout_request if timeout is None else timeout
+        pending = info.rpc.plugin_call(plugin_id, method_name, *args, **kwargs)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            raise TimeoutError(
+                f"Timed out calling '{method_name}' on plugin '{plugin_id}' after {effective_timeout}s"
+            )
+        if response.error:
+            raise RuntimeError(
+                f"Error calling '{method_name}' on plugin '{plugin_id}': {response.error}"
+            )
+        return response.result
+
+    def plugin_errors(
+        self,
+        plugin_id: str,
+        timeout: Optional[float] = None,
+    ) -> List[str]:
+        """Return recorded error messages for a loaded plugin."""
+        with self._plugins_lock:
+            info = self._plugins.get(plugin_id)
+        if info is None or not info.process.is_alive():
+            return []
+
+        effective_timeout = self.timeout_request if timeout is None else timeout
+        pending = info.rpc.plugin_errors(plugin_id)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None or response.error:
+            return []
+        return list(response.result or [])
+
     def enable_monitoring(
         self,
         sample_interval: float = 1.0,
@@ -842,7 +913,8 @@ class PluginManager:
     # Environment Variable Management
     # ========================================================================
 
-    def env_set(self, name:str, value:Any) -> None:
+    def env_set(self, name:str, value:Any) -> bool:
+        value = sanitize_for_ipc(value)
         self._env.set(name, value)
         self._env_update_queue.put((name, value))
         return True
@@ -1000,6 +1072,7 @@ class PluginManager:
         plugin_rpc.on_request(CommandType.PLUGIN_CALL, self._respond_call)  # forward
         plugin_rpc.on_request(CommandType.PLUGIN_STATUS, self._respond_plugin_status)
         plugin_rpc.on_request(CommandType.PLUGIN_STATUS_ALL, self._respond_plugin_status_all)
+        plugin_rpc.on_request(CommandType.PLUGIN_ERRORS, self._respond_plugin_errors)
 
         plugin_rpc.on_request(CommandType.ENV_SET, self._respond_env_set)
         plugin_rpc.on_request(CommandType.ENV_GET, self._respond_env_get)
@@ -1057,6 +1130,10 @@ class PluginManager:
     def _respond_plugin_status_all(self, rpc: PluginRPC, req: RequestPluginStatusAll) -> Dict[str, ProcessStatus]:
         """Return the status of every loaded plugin."""
         return self.plugin_status_all()
+
+    def _respond_plugin_errors(self, rpc: PluginRPC, req: RequestPluginErrors) -> List[str]:
+        """Return recorded error messages for the requested plugin."""
+        return self.plugin_errors(req.plugin_id or req.sender)
 
 
     # ========================================================================

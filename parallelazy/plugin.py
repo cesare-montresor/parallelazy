@@ -6,7 +6,7 @@ plugins must implement or can override.
 """
 
 import logging
-from typing import Any, Callable, Dict, Optional, TYPE_CHECKING, Self
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING, Self
 from enum import Enum
 
 from parallelazy.utils import camel_to_kebab
@@ -238,33 +238,49 @@ class Plugin:
         """Request plugin shutdown; use wait_for_stop() in blocking main() work."""
         self._worker.stop()
 
-    def topic_subscribe(self, topic:str, callback:Callable) -> None:
-        """Subscribe to a data topic or environment variable."""
-        self._worker.topic_subscribe(topic, callback)
+    def topic_subscribe(self, topic: str, callback: Callable) -> bool:
+        """Subscribe to a data topic."""
+        return self._worker.topic_subscribe(topic, callback)
 
-    def topic_publish(self, topic:str, data:Any) -> None:
-        """Publish data to a topic."""
-        self._worker.topic_publish(topic, data)
+    def topic_unsubscribe(self, topic: str) -> bool:
+        """Unsubscribe from a data topic."""
+        return self._worker.topic_unsubscribe(topic)
 
-    def env_set(self, name:str, value:Any, wait: bool = True) -> None:
+    def topic_publish(self, topic: str, data: Any) -> int:
+        """Publish data to a topic. Returns the number of subscribers that received the message."""
+        return self._worker.topic_publish(topic, data)
+
+    def topic_list(self, plugin_id: Optional[str] = None) -> List[str]:
+        """List available topics, or topics published by a specific plugin."""
+        return self._worker.topic_list(plugin_id=plugin_id)
+
+    def env_set(self, name: str, value: Any, wait: bool = True) -> bool:
         """Set an environment variable."""
-        self._worker.env_set(name, value, wait=wait)
+        return self._worker.env_set(name, value, wait=wait)
 
-    def env_get(self, name:str=None, default:Any=None) -> dict|Any:
+    def env_get(self, name: str = None, default: Any = None) -> dict | Any:
         """Get an environment variable."""
         if name is None:
-            return self._worker.env_get_all() 
+            return self._worker.env_get_all()
 
         value = self._worker.env_get(name)
         return default if value is None else value
     
-    def env_subscribe(self, name:str, callback:Callable) -> None:
+    def env_subscribe(self, name: str, callback: Callable) -> bool:
         """Subscribe to changes in an environment variable."""
-        self._worker.env_subscribe(name, callback)
+        return self._worker.env_subscribe(name, callback)
+
+    def env_unsubscribe(self, name: str) -> bool:
+        """Unsubscribe from changes in an environment variable."""
+        return self._worker.env_unsubscribe(name)
     
     def plugin_call(self, plugin_id: str, method_name: str, *args, **kwargs) -> Any:
         """Call a method provided by the manager or another plugin."""
         return self._worker.plugin_call(plugin_id, method_name, *args, **kwargs)
+
+    def plugin_errors(self, plugin_id: Optional[str] = None) -> List[str]:
+        """Get recorded error messages for this plugin or another plugin."""
+        return self._worker.plugin_errors(plugin_id)
 
     def plugin_load(
         self,
