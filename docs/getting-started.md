@@ -2,13 +2,17 @@
 
 ## Requirements
 
-- Python 3.8 or newer
+- Python 3.11 or newer
 - PyTorch
-- `debugpy` (installed as a runtime dependency)
 
 PyTorch is a required dependency because the process and IPC implementation
 uses `torch.multiprocessing`. CUDA is optional, but applications that use CUDA
 should keep the default `spawn` start method.
+
+`debugpy` is not a framework dependency. For VS Code spawned-worker debugging,
+the companion extension bridges worker attach notifications to VS Code and the
+workers reuse the debugpy version loaded by VS Code. For other debugging setups,
+install and manage debugpy in the application environment yourself.
 
 ## Install
 
@@ -24,9 +28,15 @@ For editable development installation:
 python -m pip install -e .
 ```
 
-The package metadata installs `torch` and `debugpy` automatically. Select the
-PyTorch distribution appropriate for your platform and CUDA version if your
-environment requires a custom PyTorch index.
+To include optional monitoring dependencies (`psutil` and `nvidia-ml-py`):
+
+```bash
+python -m pip install ".[monitoring]"
+```
+
+The package metadata installs `torch` and `numpy`. Select the PyTorch
+distribution appropriate for your platform and CUDA version if your environment
+requires a custom PyTorch index.
 
 ## Minimal plugin
 
@@ -100,25 +110,25 @@ imports the application module in child processes.
 The examples are Python modules, so run them from the repository root:
 
 ```bash
-python -m examples.example_count
-python -m examples.example_pubsub
-python -m examples.example_configuration
+python -m examples.example_quickstart
+python -m examples.example_tensor_pipeline
+python -m examples.example_live_config
 ```
 
 See [Examples and usage patterns](examples.md) for the complete catalog.
 
 ## Recommended shutdown pattern
 
-For multiple plugins, stop them before unloading them. The convenience
-methods make this explicit:
+Use `PluginManager` as a context manager (or call `unload_all_plugins()` in a
+`finally` block) to ensure all workers, monitoring threads, and log handlers are
+cleaned up:
 
 ```python
-try:
+with PluginManager() as manager:
+    manager.load_plugins(descriptors)
     manager.start_all_plugins()
     # application work
-finally:
-    manager.unload_all_plugins()
 ```
 
-`unload_all_plugins()` stops running plugins and then removes their manager
-records.
+`unload_all_plugins()` stops running plugins, removes their manager records, and
+closes manager log handlers.

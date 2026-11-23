@@ -236,11 +236,13 @@ class PluginLifecycleTests(unittest.TestCase):
         manager.logger.error.assert_called_once()
 
     def test_topic_callback_error_log_identifies_topic_without_repeating_plugin_id(self):
+        from parallelazy.plugin_data import _TOPIC_SHUTDOWN_SENTINEL
+
         plugin = _RaisingCallbackPlugin()
         worker = _make_worker(plugin)
         worker._is_running = True
         worker.did_start.set()
-        messages = iter(("score", None))
+        messages = iter(("score", _TOPIC_SHUTDOWN_SENTINEL))
         subscription = SimpleNamespace(
             callback=plugin.on_scores,
             queue=SimpleNamespace(get=lambda: next(messages)),

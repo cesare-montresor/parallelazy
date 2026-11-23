@@ -1,96 +1,77 @@
 # Examples and usage patterns
 
-All examples live in [examples/](../examples/) and
-can be run from the repository root with `python -m`.
+All examples live in [examples/](../examples/) and can be run from the
+repository root with `python -m`. Each example is self-contained (stdlib +
+`numpy` + `torch`), uses `with PluginManager(...) as manager:`, and prints a
+summary line after verifying its assertions.
 
 | Module | Demonstrates |
 | --- | --- |
-| `example_count` | Minimal lifecycle and main-thread work updating shared state |
-| `example_graceful_shutdown` | `on_start`, `on_stop`, and clean unloading |
-| `example_pubsub` | One publisher and one subscriber on a topic |
-| `example_env_variables` | Shared configuration and environment callbacks |
-| `example_configuration` | Descriptor options and runtime configuration |
-| `example_rpc_calls` | Calling methods between plugin processes |
-| `example_data_pipeline` | Three-stage topic pipeline with aggregate metrics |
-| `example_worker_pool` | Multiple instances consuming the same topic |
-| `example_error_handling` | Worker/plugin error reporting |
+| `example_quickstart` | Lifecycle, `work_dir`, custom log formats, and cooperative `wait_for_stop()` |
+| `example_tensor_pipeline` | 3-stage PyTorch tensor pub/sub pipeline, `topic_unsubscribe`, `topic_list`, and live monitoring |
+| `example_live_config` | Shared environment flags, stored `None` vs unset keys, FIFO `env_subscribe`, and `env_unsubscribe` |
+| `example_dynamic_orchestrator` | Supervisor plugin spawning workers dynamically with async RPC sharding (`wait=False`) |
+| `example_resilience_and_errors` | `on_error(error, source)`, `PluginState.ERROR`, `plugin_errors()`, retries, and reload recovery |
+| `example_cuda_zero_copy` | Zero-copy CUDA tensor streaming with `IpcEventPoolManaged`, `is_cleared()`, and `mark_graph_output()` |
 
-## Lifecycle
+## Quickstart & lifecycle
 
 ```bash
-python -m examples.example_count
-python -m examples.example_graceful_shutdown
+python -m examples.example_quickstart
 ```
 
-Use the first example as a minimal template. Use the shutdown example when
-adding resources such as files, sockets, model handles, or CUDA objects:
-release those resources in `on_stop()`.
+Starts a `TelemetryAgent` plugin that emits periodic heartbeats to shared
+environment state, customizes its console log format, and writes a JSON summary
+into `self.work_dir` during `on_stop()`.
 
-## Pub/sub
+## Multi-stage PyTorch tensor pipeline + monitoring
 
 ```bash
-python -m examples.example_pubsub
-python -m examples.example_data_pipeline
+python -m examples.example_tensor_pipeline
 ```
 
-The pipeline example illustrates a useful convention: publish structured
-dictionaries on topics and use environment keys for progress and final
-metrics. Each stage subscribes in `on_start()` before the source begins
-publishing.
+Runs a 3-stage pipeline (`FrameSource` -> `FeatureExtractor` ->
+`AnomalyDetector`) using `load_plugins(parallel=True)`, `topic_publish` /
+`topic_subscribe` / `topic_unsubscribe`, `topic_list`, and live
+`enable_monitoring()` / `print_monitoring_report()`.
 
-## Shared configuration
+## Live configuration control plane
 
 ```bash
-python -m examples.example_env_variables
-python -m examples.example_configuration
+python -m examples.example_live_config
 ```
 
-Configuration values are ordinary Python values, so keep them serializable
-and use stable, namespaced keys. `example_configuration` also shows how
-descriptor options are merged and consumed by the plugin constructor.
+Demonstrates live hyperparameter updates via `env_set` and `env_subscribe`,
+distinguishing an explicitly stored `None` from an unset key in `env_get`, and
+cleanly detaching an auditor subscriber via `env_unsubscribe`.
 
-## RPC
+## Dynamic orchestrator & async RPC sharding
 
 ```bash
-python -m examples.example_rpc_calls
+python -m examples.example_dynamic_orchestrator
 ```
 
-The provider exposes ordinary methods (`get_data`, `get_item`, and
-`add_data`). The consumer calls them with `plugin_call`. This is a
-request/response operation, not a topic broadcast, and should be guarded with
-error handling when a target plugin can stop independently.
+Shows a supervisor plugin (`Orchestrator`) dynamically loading and starting
+multiple `ComputeWorker` instances, sharding work across them with async
+`plugin_call(..., wait=False)`, inspecting `plugin_status_all()`, and unloading
+temporary workers on completion.
 
-## Worker pools
+## Resilience, `on_error`, and recovery
 
 ```bash
-python -m examples.example_worker_pool
+python -m examples.example_resilience_and_errors
 ```
 
-The manager can load several descriptors for the same class. Give each
-descriptor a unique name, then track per-instance metrics with namespaced
-environment keys.
+Exercises transient RPC retries, circuit breaking, `Plugin.on_error(error,
+source)`, `PluginState.ERROR` on startup failure, `plugin_errors()`, and
+unloading/reloading a fresh plugin instance.
 
-## Error handling
+## Zero-copy CUDA tensor streaming
 
 ```bash
-python -m examples.example_error_handling
+python -m examples.example_cuda_zero_copy
 ```
 
-Use the example to see how exceptions in plugin work are logged and how
-application code can inspect plugin state. Errors in an RPC target should be
-handled by the calling plugin rather than silently ignored.
-
-## Reusing an example
-
-Copy the smallest relevant example and change:
-
-1. the plugin class and its descriptor metadata;
-2. `on_start()` subscriptions and resource initialization;
-3. `main()` for synchronous work (loop there and check `wait_for_stop()`), or
-   leave it empty for callback-driven work;
-4. `on_stop()` cleanup and final metrics; and
-5. the manager's load/start/stop/unload sequence.
-
-Keep application startup under a `main()` function and protect it with the
-standard `if __name__ == "__main__"` guard because workers use multiprocessing
-spawn.
+Streams CUDA tensors between `GpuProducer` and `GpuConsumer` using
+`IpcEventPoolManaged` (`acquire`, `record`, `wait`, `clear`, `is_cleared`,
+`wait_all_free`) and `mark_graph_output()`. Skips cleanly on CPU-only hosts.

@@ -13,13 +13,33 @@ Command dispatch:
 
 import logging
 import importlib
-from queue import Full
+import selectors
 import threading
+import traceback
+from multiprocessing.reduction import ForkingPickler
 from multiprocessing.sharedctypes import Synchronized
 
-
 from parallelazy.utils import init_debugger, is_debugging_enabled
-from parallelazy.plugin_data import  Channel, CommandType, PluginStartupPhase, ProcessStatus, Queue,QueueDescriptor, PendingRequest, PluginStatus,  RequestPluginErrors, RequestPluginStart, RequestPluginStatus, RequestPluginStop, RequestTopicList, Subscriber, Subscription
+from parallelazy.plugin_data import (
+    Channel,
+    CommandType,
+    _EnvMissing,
+    PluginStartupPhase,
+    ProcessStatus,
+    Queue,
+    QueueDescriptor,
+    PendingRequest,
+    PluginStatus,
+    RequestPluginErrors,
+    RequestPluginStart,
+    RequestPluginStatus,
+    RequestPluginStop,
+    RequestTopicList,
+    Subscriber,
+    Subscription,
+    _TOPIC_SHUTDOWN_SENTINEL,
+    _TopicShutdownSentinel,
+)
 from parallelazy.plugin import Plugin, PluginDescriptor, PluginState
 from parallelazy.plugin_logging import (
     LoggingSession,
@@ -30,6 +50,7 @@ from parallelazy.plugin_logging import (
 )
 
 from parallelazy.plugin_rpc import  PluginRPC, RequestEnvUpdate, RequestPluginCall, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe, sanitize_for_ipc
+from parallelazy.plugin_transport import release_cuda_ipc, sanitize_for_ipc_with_info
 from multiprocessing.synchronize import Event
 
 
@@ -47,6 +68,50 @@ def _set_startup_phase(
 ) -> None:
     if startup_phase is not None:
         startup_phase.value = int(phase)
+
+
+def _deliver_to_subscribers(
+    topic: str,
+    data: Any,
+    subscribers: list,
+    log: logging.Logger,
+    has_tensor: bool = False,
+) -> tuple[int, list[str]]:
+    """Fan out a payload to subscribers, isolating failures and reporting dead IDs."""
+    payload_bytes = None
+    if len(subscribers) > 1 and not has_tensor:
+        try:
+            payload_bytes = bytes(ForkingPickler.dumps(data))
+        except Exception:
+            payload_bytes = None
+
+    delivered = 0
+    dead_ids: list[str] = []
+    for sub_id, subscriber in subscribers:
+        try:
+            if payload_bytes is not None:
+                subscriber.queue.send_bytes(payload_bytes)
+            else:
+                subscriber.queue.put(data)
+            delivered += 1
+        except (BrokenPipeError, EOFError, OSError, ValueError) as e:
+            log.warning(
+                "Subscriber '%s' on topic '%s' is unavailable (%s); evicting",
+                sub_id,
+                topic,
+                e,
+            )
+            dead_ids.append(sub_id)
+            subscriber.close()
+        except Exception as e:
+            log.error(
+                "Failed to publish to subscriber '%s' on topic '%s': %s",
+                sub_id,
+                topic,
+                e,
+                exc_info=True,
+            )
+    return delivered, dead_ids
 
 
 # ============================================================================
@@ -73,6 +138,7 @@ class PluginWorker:
         initialized: Event,
         runtime_settings: Optional[PluginRuntimeSettings] = None,
         startup_phase: Optional[Synchronized] = None,
+        init_error_conn: Any = None,
     ) -> None:
         """
         Entry point for plugin subprocess.
@@ -85,6 +151,7 @@ class PluginWorker:
             initialized: Event to signal initialization completion
             runtime_settings: Resolved paths and logging settings for this worker
             startup_phase: Shared startup phase state for manager visibility
+            init_error_conn: Optional pipe write-end to report initialization errors
         """
         _set_startup_phase(startup_phase, PluginStartupPhase.PROCESS_STARTED)
         logging_session = None
@@ -111,6 +178,12 @@ class PluginWorker:
                 logging_session=logging_session,
                 startup_phase=startup_phase,
             )
+            if init_error_conn is not None:
+                try:
+                    init_error_conn.close()
+                except Exception:
+                    pass
+                init_error_conn = None
             worker.main()
         except Exception:
             if (
@@ -118,8 +191,18 @@ class PluginWorker:
                 and startup_phase.value < PluginStartupPhase.READY
             ):
                 _set_startup_phase(startup_phase, PluginStartupPhase.FAILED)
+                if init_error_conn is not None:
+                    try:
+                        init_error_conn.send(traceback.format_exc())
+                    except Exception:
+                        pass
             raise
         finally:
+            if init_error_conn is not None:
+                try:
+                    init_error_conn.close()
+                except Exception:
+                    pass
             if output_capture is not None:
                 output_capture.close()
             if logging_session is not None:
@@ -148,6 +231,7 @@ class PluginWorker:
         self.options = options
         self.work_dir = runtime_settings.work_dir
         self.log_dir = runtime_settings.log_dir
+        self.timeout_request = getattr(runtime_settings, "timeout_request", 5.0)
         self._is_running = False
         self._initialized: Event = initialized
         self._startup_phase = startup_phase
@@ -162,14 +246,15 @@ class PluginWorker:
         self._start_complete = False
         self._active_callbacks = 0
         
-        # Topic subscriptions: topic_name -> queue
-        
+        # Topic subscriptions: topic_name -> Subscription
         self.topic_published = set()
         self.topic_subscriptions: Dict[str, Subscription] = {}
-        self.topic_subscribers: Dict[str, Dict[str,Subscriber]] = {}
+        self.topic_subscribers: Dict[str, Dict[str, Subscriber]] = {}
         self._topic_subscribers_lock = threading.RLock()
-        # Topic subscriptions: topic_name -> queue
+        # Env subscriptions: var_name -> callback
         self.env_subscriptions: Dict[str, Callable] = {}
+        self._env_subscriptions_lock = threading.RLock()
+        self._env_initializing: Dict[str, list] = {}
         
         # Error log
         self.error_log: list = []
@@ -179,9 +264,15 @@ class PluginWorker:
         
         self.main_thread: Optional[threading.Thread] = None
 
-        # Create manager proxy for direct manager access+
+        # Create manager proxy for direct manager access
         channel = Channel(queue_descriptor)
-        self.rpc = PluginRPC(self.plugin_id, channel, start_listener=False)
+        self.rpc = PluginRPC(
+            self.plugin_id,
+            channel,
+            timeout=self.timeout_request,
+            start_listener=False,
+            on_disconnect=self._request_stop,
+        )
 
         try:
             self._init_rpc()
@@ -206,6 +297,30 @@ class PluginWorker:
     ## ========================================================================
     # Worker Main Loop
     # ========================================================================
+
+    def _record_error(
+        self,
+        error: Exception,
+        source: str,
+        set_error_state: bool = False,
+    ) -> None:
+        """Record an error in error_log, optionally mark ERROR state, and invoke plugin.on_error."""
+        self.error_log.append(str(error))
+        plugin = getattr(self, "plugin", None)
+        if plugin is None:
+            return
+        if set_error_state:
+            plugin.state = PluginState.ERROR
+        on_error = getattr(plugin, "on_error", None)
+        if callable(on_error):
+            try:
+                on_error(error, source=source)
+            except Exception:
+                logger.error(
+                    "Error inside plugin.on_error (source=%s)",
+                    source,
+                    exc_info=True,
+                )
 
     def main(self) -> None:
         """Run plugin work on the process main thread, then await shutdown."""
@@ -233,7 +348,7 @@ class PluginWorker:
                     self._request_stop()
                 except Exception as e:
                     logger.error("Plugin error in main: %s", e, exc_info=True)
-                    self.error_log.append(str(e))
+                    self._record_error(e, source="main", set_error_state=True)
 
             self._stop_requested.wait()
             self._finish_stop()
@@ -271,6 +386,9 @@ class PluginWorker:
             self.plugin.on_stop()
         except Exception as e:
             logger.error(f"Failed to stop plugin: {e}", exc_info=True)
+            self._record_error(e, source="on_stop")
+
+        release_cuda_ipc()
 
         with self._lifecycle:
             self.plugin._is_running = False
@@ -281,12 +399,31 @@ class PluginWorker:
         # Let stop handlers send their responses before closing the channel.
         self.rpc.drain_commands()
 
+    def _get_topic_lock(self) -> threading.RLock:
+        lock = getattr(self, "_topic_subscribers_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._topic_subscribers_lock = lock
+        return lock
+
+    def _get_env_lock(self) -> threading.RLock:
+        lock = getattr(self, "_env_subscriptions_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._env_subscriptions_lock = lock
+        return lock
+
     def _wake_topic_listeners(self) -> None:
-        for topic, subscription in list(self.topic_subscriptions.items()):
+        with self._get_topic_lock():
+            items = list(self.topic_subscriptions.items())
+        for topic, subscription in items:
             try:
-                subscription.queue.put(None)
+                if hasattr(subscription, "signal_stop"):
+                    subscription.signal_stop()
+                else:
+                    subscription.queue.put(_TOPIC_SHUTDOWN_SENTINEL)
             except Exception as e:
-                logger.error(f"Error closing queue for topic '{topic}': {e}")
+                logger.error(f"Error waking topic listener for '{topic}': {e}")
 
     def start(self) -> bool:
         """Start the plugin once; the worker's main thread invokes plugin.main()."""
@@ -303,6 +440,7 @@ class PluginWorker:
             self.plugin.on_start()
         except Exception as e:
             logger.error(f"Failed to start plugin: {e}", exc_info=True)
+            self._record_error(e, source="on_start", set_error_state=True)
             with self._lifecycle:
                 self._start_in_progress = False
                 self._lifecycle.notify_all()
@@ -421,13 +559,32 @@ class PluginWorker:
         + PLUGIN_ERRORS = "plugin_errors"
         > PLUGIN_CALL = "plugin_call"
     """
-    def plugin_call(self, plugin_id: str, method_name: str, *args, wait: bool=True, **kwargs) -> PendingRequest|Any:
+    def _resolve_timeout(self, timeout: Optional[float]) -> Optional[float]:
+        if timeout is not None:
+            return timeout
+        return getattr(self, "timeout_request", 5.0)
+
+    def plugin_call(
+        self,
+        plugin_id: str,
+        method_name: str,
+        *args,
+        wait: bool = True,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> PendingRequest | Any:
         """Invoke a method on the plugin via RPC."""
         pending: PendingRequest = self.rpc.plugin_call(plugin_id, method_name, *args, **kwargs)
-        if not wait: return pending
+        if not wait:
+            return pending
         
-        # Wait for response if no callback provided
-        response = pending.wait()
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out calling plugin method '{method_name}' on '{plugin_id}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return None
         if response.error:
             logger.error(f"Error calling plugin method '{method_name}': {response.error}")
             self.error_log.append(str(response.error))
@@ -438,74 +595,152 @@ class PluginWorker:
         self,
         descriptor: PluginDescriptor,
         options: Dict[str, Any] = None,
-        wait: bool = True
+        wait: bool = True,
+        timeout: Optional[float] = None,
     ) -> PendingRequest | bool:
         """Ask the manager to load a plugin instance described by descriptor."""
         pending = self.rpc.plugin_load(descriptor, options)
         if not wait:
             return pending
-        response = pending.wait()
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out loading plugin '{descriptor.name}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return False
         if response.error:
             logger.error(f"Error loading plugin '{descriptor.name}': {response.error}")
             self.error_log.append(str(response.error))
             return False
         return response.result
 
-    def plugin_start(self, plugin_id: str, wait: bool = True) -> PendingRequest | bool:
+    def plugin_start(
+        self,
+        plugin_id: str,
+        wait: bool = True,
+        timeout: Optional[float] = None,
+    ) -> PendingRequest | bool:
         """Ask the manager to start another plugin."""
         pending = self.rpc.plugin_start(plugin_id)
         if not wait:
             return pending
-        response = pending.wait()
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out starting plugin '{plugin_id}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return False
         if response.error:
             logger.error(f"Error starting plugin: {response.error}")
             self.error_log.append(str(response.error))
             return False
         return response.result
 
-    def plugin_stop(self, plugin_id: str, wait: bool = True) -> PendingRequest | bool:
+    def plugin_stop(
+        self,
+        plugin_id: str,
+        wait: bool = True,
+        timeout: Optional[float] = None,
+    ) -> PendingRequest | bool:
         """Ask the manager to stop another plugin."""
         pending = self.rpc.plugin_stop(plugin_id)
         if not wait:
             return pending
-        response = pending.wait()
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out stopping plugin '{plugin_id}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return False
         if response.error:
             logger.error(f"Error stopping plugin: {response.error}")
             self.error_log.append(str(response.error))
             return False
         return response.result
 
-    def plugin_unload(self, plugin_id: str, wait: bool = True) -> PendingRequest | bool:
+    def plugin_unload(
+        self,
+        plugin_id: str,
+        wait: bool = True,
+        timeout: Optional[float] = None,
+    ) -> PendingRequest | bool:
         """Ask the manager to unload another plugin."""
         pending = self.rpc.plugin_unload(plugin_id)
         if not wait:
             return pending
-        response = pending.wait()
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out unloading plugin '{plugin_id}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return False
         if response.error:
             logger.error(f"Error unloading plugin: {response.error}")
             self.error_log.append(str(response.error))
             return False
         return response.result
 
-    def plugin_status(self, plugin_id: str = None) -> Optional[ProcessStatus]:
+    def plugin_status(
+        self,
+        plugin_id: str = None,
+        timeout: Optional[float] = None,
+    ) -> Optional[ProcessStatus]:
         """Get the status of this plugin or another loaded plugin."""
         pending: PendingRequest = self.rpc.plugin_status(plugin_id)
-        response = pending.wait()
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out getting status for plugin '{plugin_id}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return None
         if response.error:
             logger.error(f"Error getting plugin status: {response.error}")
             self.error_log.append(str(response.error))
             return None
         return response.result
 
-    def plugin_status_all(self) -> Dict[str, ProcessStatus]:
+    def plugin_status_all(self, timeout: Optional[float] = None) -> Dict[str, ProcessStatus]:
         """Get the status of all loaded plugins."""
         pending: PendingRequest = self.rpc.plugin_status_all()
-        response = pending.wait()
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out getting all plugin statuses after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return None
         if response.error:
             logger.error(f"Error getting all plugin statuses: {response.error}")
             self.error_log.append(str(response.error))
             return None
         return response.result
+
+    def plugin_errors(
+        self,
+        plugin_id: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> list:
+        """Get recorded error messages for this plugin or another plugin."""
+        if plugin_id is None or plugin_id == self.plugin_id:
+            return list(self.error_log)
+        pending: PendingRequest = self.rpc.plugin_errors(plugin_id)
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out getting errors for plugin '{plugin_id}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return []
+        if response.error:
+            logger.error(f"Error getting plugin errors for '{plugin_id}': {response.error}")
+            self.error_log.append(str(response.error))
+            return []
+        return list(response.result or [])
 
 
     """Commands that plugin can send to manager or other plugins.
@@ -515,80 +750,163 @@ class PluginWorker:
         > ENV_SUBSCRIBE = "env_subscribe"
         > ENV_UNSUBSCRIBE = "env_unsubscribe"
     """
-    def env_set(self, var_name: str, value: Any, wait: bool=True) -> PendingRequest|bool:
+    def env_set(
+        self,
+        var_name: str,
+        value: Any,
+        wait: bool = True,
+        timeout: Optional[float] = None,
+    ) -> PendingRequest | bool:
         """Set an environment variable."""
-        pending: PendingRequest = self.rpc.env_set( var_name, value)
-        if not wait: return pending
+        pending: PendingRequest = self.rpc.env_set(var_name, value)
+        if not wait:
+            return pending
         
-        # Wait for response if no callback provided
-        response = pending.wait()
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out setting env variable '{var_name}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return False
         if response.error:
             logger.error(f"Error setting env variable: {response.error}")
             self.error_log.append(str(response.error))
             return False
         return response.result
     
-    def env_get(self, var_name: str, wait: bool=True) -> PendingRequest|Any:
+    def env_get(
+        self,
+        var_name: str,
+        default: Any = None,
+        wait: bool = True,
+        timeout: Optional[float] = None,
+    ) -> PendingRequest | Any:
         """Get an environment variable."""
         pending: PendingRequest = self.rpc.env_get(var_name)
-        if not wait: return pending
+        if not wait:
+            return pending
         
-        # Wait for response if no callback provided
-        response = pending.wait()
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out getting env variable '{var_name}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return default
         if response.error:
             logger.error(f"Error getting env variable: {response.error}")
             self.error_log.append(str(response.error))
-            return None
+            return default
+        if isinstance(response.result, _EnvMissing):
+            return default
         return response.result
     
-    def env_get_all(self, wait: bool=True) -> PendingRequest|dict:
+    def env_get_all(
+        self,
+        wait: bool = True,
+        timeout: Optional[float] = None,
+    ) -> PendingRequest | dict:
         """Get all environment variables."""
         pending: PendingRequest = self.rpc.env_get_all()
-        if not wait: return pending
+        if not wait:
+            return pending
         
-        # Wait for response if no callback provided
-        response = pending.wait()
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out getting all env variables after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return None
         if response.error:
             logger.error(f"Error getting all env variables: {response.error}")
             self.error_log.append(str(response.error))
             return None
         return response.result
     
-    def env_subscribe(self, var_name: str, callback: Callable) -> bool:
+    def env_subscribe(
+        self,
+        var_name: str,
+        callback: Callable,
+        timeout: Optional[float] = None,
+    ) -> bool:
         """Subscribe to environment updates and invoke callback with the value."""
+        env_lock = self._get_env_lock()
+        if not hasattr(self, "_env_initializing"):
+            self._env_initializing = {}
+        with env_lock:
+            self._env_initializing[var_name] = []
 
+        effective_timeout = self._resolve_timeout(timeout)
         pending: PendingRequest = self.rpc.env_subscribe(var_name)
-        
-        # Wait for response if no callback provided
-        response = pending.wait()
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            with env_lock:
+                self._env_initializing.pop(var_name, None)
+            msg = f"Timed out subscribing to env variable '{var_name}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return False
         if response.error:
-            logger.error(f"Error getting all env variables: {response.error}")
+            with env_lock:
+                self._env_initializing.pop(var_name, None)
+            logger.error(f"Error subscribing to env variable '{var_name}': {response.error}")
             self.error_log.append(str(response.error))
             return False
-        
-        self.env_subscriptions[var_name] = callback
 
-        initial = self.rpc.env_get(var_name).wait()
-        if initial is not None and not initial.error:
-            callback(initial.result)
-        else:
-            callback(None)
+        try:
+            initial = self.rpc.env_get(var_name).wait(timeout=effective_timeout)
+            if initial is not None and not initial.error and not isinstance(initial.result, _EnvMissing):
+                callback(initial.result)
+            else:
+                callback(None)
+
+            while True:
+                with env_lock:
+                    queued = self._env_initializing.get(var_name)
+                    if not queued:
+                        self._env_initializing.pop(var_name, None)
+                        self.env_subscriptions[var_name] = callback
+                        break
+                    batch = list(queued)
+                    queued.clear()
+                for val in batch:
+                    callback(val)
+        except Exception:
+            with env_lock:
+                self._env_initializing.pop(var_name, None)
+                self.env_subscriptions[var_name] = callback
+            raise
 
         return True
     
-    def env_unsubscribe(self, var_name: str, wait: bool=True) -> bool:
-        """Get all environment variables."""
+    def env_unsubscribe(
+        self,
+        var_name: str,
+        wait: bool = True,
+        timeout: Optional[float] = None,
+    ) -> PendingRequest | bool:
+        """Unsubscribe from an environment variable."""
         pending: PendingRequest = self.rpc.env_unsubscribe(var_name)
-        
-        # Wait for response if no callback provided
-        response = pending.wait()
+        if not wait:
+            return pending
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out unsubscribing from env variable '{var_name}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return False
         if response.error:
-            logger.error(f"Error getting all env variables: {response.error}")
+            logger.error(f"Error unsubscribing from env variable '{var_name}': {response.error}")
             self.error_log.append(str(response.error))
             return False
         
-        if var_name in self.env_subscriptions:
-            del self.env_subscriptions[var_name]
+        with self._get_env_lock():
+            self.env_subscriptions.pop(var_name, None)
+            if hasattr(self, "_env_initializing"):
+                self._env_initializing.pop(var_name, None)
         return True
     
 
@@ -600,133 +918,165 @@ class PluginWorker:
         * TOPIC_LIST = "topic_list"
     """
 
-    def topic_subscribe(self, topic: str, callback: Callable) -> bool:
-        """Get all environment variables."""
+    def topic_subscribe(
+        self,
+        topic: str,
+        callback: Callable,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Subscribe to a topic."""
         subscription = Subscription(topic, callback)
 
-        desc = subscription.queue.descriptor()
-        subscriber = Subscriber(self.plugin_id, topic, desc  )
-        
+        desc = subscription.queue.send_descriptor()
+        subscriber = Subscriber(self.plugin_id, topic, desc)
 
         pending: PendingRequest = self.rpc.topic_subscribe(subscriber)
-        subscriber.queue = Queue( desc )
-        # Wait for response if no callback provided
-        response = pending.wait()
+        subscription.queue.close_sender()
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            subscription.close()
+            msg = f"Timed out subscribing to topic '{topic}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return False
         if response.error:
+            subscription.close()
             logger.error(f"Error subscribing to topic '{topic}': {response.error}")
             self.error_log.append(str(response.error))
             return False
         if response.result:
             subscription.thread = threading.Thread(target=self._topic_listener, args=(topic,), daemon=True)
-            self.topic_subscriptions[topic] = subscription
+            with self._get_topic_lock():
+                previous = self.topic_subscriptions.get(topic)
+                self.topic_subscriptions[topic] = subscription
+            if previous is not None and previous is not subscription:
+                previous.close()
             subscription.thread.start()
+        else:
+            subscription.close()
         return response.result
     
-    def topic_unsubscribe(self, topic: str) -> bool:
-        """Get all environment variables."""
-        if not topic in self.topic_subscriptions:
+    def topic_unsubscribe(
+        self,
+        topic: str,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Unsubscribe from a topic."""
+        with self._get_topic_lock():
+            subscription = self.topic_subscriptions.get(topic)
+        if subscription is None:
             logger.warning("Not subscribed to topic '%s'", topic)
             return True
         
-        subscription = self.topic_subscriptions[topic] 
-        desc = subscription.queue.descriptor()
-        subscriber = Subscriber(self.plugin_id, topic, desc  )
-
+        subscriber = Subscriber(self.plugin_id, topic, QueueDescriptor())
 
         pending: PendingRequest = self.rpc.topic_unsubscribe(subscriber)
-        # Wait for response if no callback provided
-        response = pending.wait()
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out unsubscribing from topic '{topic}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return False
         if response.error:
-            logger.error(f"Error unsubscribing to topic '{topic}': {response.error}")
+            logger.error(f"Error unsubscribing from topic '{topic}': {response.error}")
             self.error_log.append(str(response.error))
             return False
         
         if response.result:
-            del self.topic_subscriptions[topic]
-            subscription.queue.close()
-            subscription.thread.join(timeout=1.0)
-            
+            with self._get_topic_lock():
+                self.topic_subscriptions.pop(topic, None)
+            subscription.signal_stop()
+            if subscription.thread is not None and subscription.thread.is_alive():
+                subscription.thread.join(timeout=1.0)
+            subscription.close()
 
         return response.result
 
 
-    def topic_list(self, wait: bool=True) -> PendingRequest|list:
-        """Get all environment variables."""
-        pending: PendingRequest = self.rpc.topic_list()
-        if not wait: return pending
+    def topic_list(
+        self,
+        plugin_id: Optional[str] = None,
+        wait: bool = True,
+        timeout: Optional[float] = None,
+    ) -> PendingRequest | list:
+        """List available topics."""
+        pending: PendingRequest = self.rpc.topic_list(plugin_id=plugin_id)
+        if not wait:
+            return pending
         
-        # Wait for response if no callback provided
-        response = pending.wait()
+        effective_timeout = self._resolve_timeout(timeout)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out listing topics after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return None
         if response.error:
-            logger.error(f"Error getting all env variables: {response.error}")
+            logger.error(f"Error listing topics: {response.error}")
             self.error_log.append(str(response.error))
             return None
         return response.result
     
 
-    def topic_announce(self, topic: str) -> None:
-        """ Announce a topic to manager and sync subscribers."""
+    def topic_announce(self, topic: str, timeout: Optional[float] = None) -> bool:
+        """Announce a topic to manager and sync subscribers."""
         # first time publishing this topic
-        if topic in self.topic_published: return True
-
-        with self._topic_subscribers_lock:
+        with self._get_topic_lock():
+            if topic in self.topic_published:
+                return True
             if topic not in self.topic_subscribers:
                 self.topic_subscribers[topic] = {}
             topic_subscribers = self.topic_subscribers[topic]
-        reponse = self.rpc.topic_announce(topic).wait()
-        if reponse.error:
-            logger.error(f"Error registering topic '{topic}': {reponse.error}")
-            self.error_log.append(str(reponse.error))
+        effective_timeout = self._resolve_timeout(timeout)
+        response = self.rpc.topic_announce(topic).wait(timeout=effective_timeout)
+        if response is None:
+            msg = f"Timed out announcing topic '{topic}' after {effective_timeout}s"
+            logger.error(msg)
+            self.error_log.append(msg)
+            return False
+        if response.error:
+            logger.error(f"Error registering topic '{topic}': {response.error}")
+            self.error_log.append(str(response.error))
             return False
         
 
-        self.topic_published.add(topic)
+        manager_subscribers: Dict[str, Subscriber] = response.result
 
-        manager_subscribers: Dict[str, Subscriber] = reponse.result
-
-
-        diff_subs =  [] 
-        for sub in manager_subscribers.values():
-            if sub.plugin_id not in topic_subscribers:
-                sub.queue = Queue(sub.queue_descriptor)
-                diff_subs.append(sub)
-                topic_subscribers[sub.plugin_id] = sub
-
-        with self._topic_subscribers_lock:
-            topic_subscribers.update(manager_subscribers)
-        #print("topic_announce: manager_subscribers: ", self.topic_published, manager_subscribers )
-        
+        with self._get_topic_lock():
+            self.topic_published.add(topic)
+            for sub in manager_subscribers.values():
+                if sub.plugin_id not in topic_subscribers:
+                    sub.queue = Queue(sub.queue_descriptor)
+                    topic_subscribers[sub.plugin_id] = sub
 
         return True
 
-    def topic_publish(self, topic: str, data: Any) -> None:
-        data = sanitize_for_ipc(data)
+    def topic_publish(self, topic: str, data: Any) -> int:
+        data, has_tensor = sanitize_for_ipc_with_info(data)
 
         self.topic_announce(topic)
         
         with self._topic_subscribers_lock:
-            topic_subscribers = dict(
-                self.topic_subscribers.get(topic, {})
-            )
-        if not topic_subscribers: return
-            
+            subscribers = list(self.topic_subscribers.get(topic, {}).items())
+        if not subscribers:
+            return 0
 
-        #print("topic_publish: topic_subscribers: ",self.topic_subscribers)
+        delivered, dead_ids = _deliver_to_subscribers(
+            topic, data, subscribers, logger, has_tensor=has_tensor
+        )
 
-        for subscriber in topic_subscribers.values():
-            #print("----")
+        if dead_ids:
+            with self._topic_subscribers_lock:
+                topic_subs = self.topic_subscribers.get(topic)
+                if topic_subs is not None:
+                    for sub_id in dead_ids:
+                        removed = topic_subs.pop(sub_id, None)
+                        if removed is not None:
+                            removed.close()
 
-            try:
-                subscriber.queue.put_nowait(data)
-            except Full:
-                logger.warning(f"Subscriber {subscriber.plugin_id} on topic '{topic}' is full — dropping message")
-                return False
-            except Exception as e:
-                logger.error(f"[ERROR] Failed to publish to subscriber {subscriber.plugin_id} on topic '{topic}':", exc_info=True)
-                logger.error(f"[ERROR]\n{e}\n---")
-                return False
-        
-        return True
+        return delivered
     
     
 
@@ -745,9 +1095,10 @@ class PluginWorker:
     
     def _respond_status(self, rpc: PluginRPC, req: RequestPluginStatus) -> Dict[str, Any]:
         """Get plugin status."""
-        num_subscription = len(self.topic_subscriptions.keys())
-        num_subscribers = sum(len(subs) for subs in self.topic_subscribers.values())
-        num_published = len(self.topic_published)
+        with self._get_topic_lock():
+            num_subscription = len(self.topic_subscriptions)
+            num_subscribers = sum(len(subs) for subs in self.topic_subscribers.values())
+            num_published = len(self.topic_published)
         num_errors = len(self.error_log)
 
         status = PluginStatus(
@@ -776,7 +1127,11 @@ class PluginWorker:
         
         method = getattr(self.plugin, method_name)
         
-        result = method(*args, **kwargs)
+        try:
+            result = method(*args, **kwargs)
+        except Exception as e:
+            self._record_error(e, source=f"rpc:{method_name}")
+            raise
         result = sanitize_for_ipc(result)
 
         return result
@@ -787,10 +1142,20 @@ class PluginWorker:
     def _respond_env_update(self, rpc: PluginRPC, req: RequestEnvUpdate) -> None:
         """Receive environment variable change notification."""
         var_name = req.name
-        callback = self.env_subscriptions.get(var_name)
+        with self._get_env_lock():
+            initializing = getattr(self, "_env_initializing", None)
+            if initializing is not None and var_name in initializing:
+                initializing[var_name].append(req.value)
+                return True
+            callback = self.env_subscriptions.get(var_name)
         if callback is None:
             return True
-        self._invoke_callback(callback, req.value)
+        try:
+            self._invoke_callback(callback, req.value)
+        except Exception as e:
+            logger.error("Error in env '%s' callback: %s", var_name, e, exc_info=True)
+            self._record_error(e, source=f"env:{var_name}")
+            return False
         return True
 
     def _invoke_callback(self, callback: Callable, *args) -> None:
@@ -815,59 +1180,81 @@ class PluginWorker:
         self.did_start.wait()  # Ensure plugin has started before processing messages
         with getattr(self, "_topic_subscribers_lock", threading.RLock()):
             registered = self.topic_subscriptions.get(topic)
-        
-        while True:
-            
-            if self._is_running is False:
-                logger.info("Worker stopping, exiting topic listener for '%s'", topic)
-                break
+        if registered is None:
+            return
 
-            # check is subscription still active (in case unsubscribed while waiting for data)
-            with getattr(self, "_topic_subscribers_lock", threading.RLock()):
-                cur = self.topic_subscriptions.get(topic,None)
-            if cur is None or cur != registered: 
-                logger.info(f"Subscription for topic '{topic}' no longer registered, stopping listener thread")
-                break
-            
-
-            # pull data from subscription queue (blocking)
+        wakeup_r = getattr(registered, "_wakeup_r", None)
+        receiver = getattr(registered.queue, "receiver", None)
+        recv_conn = receiver._conn if receiver is not None else None
+        selector = None
+        if wakeup_r is not None and recv_conn is not None:
+            selector = selectors.DefaultSelector()
             try:
-                data = registered.queue.get() # Blocking wait for new data
-                if data is None:
-                    logger.info("Received shutdown sentinel for topic '%s'", topic)
+                selector.register(recv_conn, selectors.EVENT_READ, data="data")
+                selector.register(wakeup_r, selectors.EVENT_READ, data="stop")
+            except Exception:
+                selector.close()
+                selector = None
+
+        try:
+            while True:
+                if self._is_running is False or getattr(registered, "_stopped", False):
+                    logger.info("Worker stopping, exiting topic listener for '%s'", topic)
                     break
-            except ValueError as e:
-                if registered.queue.closed():
-                    logger.info(f"Subscription for topic '{topic}' queue closed, stopping listener thread")
+
+                # check is subscription still active (in case unsubscribed while waiting for data)
+                with getattr(self, "_topic_subscribers_lock", threading.RLock()):
+                    cur = self.topic_subscriptions.get(topic, None)
+                if cur is None or cur != registered:
+                    logger.info(f"Subscription for topic '{topic}' no longer registered, stopping listener thread")
                     break
-                else:
-                    logger.error(f"Error getting data from topic '{topic}' queue: {e}")
+
+                # pull data from subscription queue (fast path if already buffered, else reusable selector)
+                try:
+                    if selector is not None and not recv_conn.poll(0):
+                        events = selector.select()
+                        if any(key.data == "stop" for key, _ in events):
+                            logger.info("Received shutdown signal for topic '%s'", topic)
+                            break
+                    data = registered.queue.get()  # Blocking wait for new data
+                    if isinstance(data, _TopicShutdownSentinel):
+                        logger.info("Received shutdown sentinel for topic '%s'", topic)
+                        break
+                except ValueError as e:
+                    if registered.queue.closed():
+                        logger.info(f"Subscription for topic '{topic}' queue closed, stopping listener thread")
+                        break
+                    else:
+                        logger.error(f"Error getting data from topic '{topic}' queue: {e}")
+                        self.error_log.append(str(e))
+                        continue
+                except (EOFError, OSError) as e:
+                    logger.info(
+                        "Subscription for topic '%s' closed, stopping listener thread: %s",
+                        topic,
+                        e,
+                    )
+                    break
+                except Exception as e:
+                    logger.error(f"Error in topic '{topic}' listener: {e}", exc_info=True)
                     self.error_log.append(str(e))
                     continue
-            except (EOFError, OSError) as e:
-                logger.info(
-                    "Subscription for topic '%s' closed, stopping listener thread: %s",
-                    topic,
-                    e,
-                )
-                break
-            except Exception as e:
-                logger.error(f"Error in topic '{topic}' listener: {e}", exc_info=True)
-                self.error_log.append(str(e))
-                continue
 
-            # Call the plugin's callback with the new data
-            try:
-                self._invoke_callback(registered.callback, data)
-            except Exception as e:
-                logger.error(
-                    "Error in topic '%s' callback: %s",
-                    topic,
-                    e,
-                    exc_info=True,
-                )
-                self.error_log.append(str(e))
-                continue
+                # Call the plugin's callback with the new data
+                try:
+                    self._invoke_callback(registered.callback, data)
+                except Exception as e:
+                    logger.error(
+                        "Error in topic '%s' callback: %s",
+                        topic,
+                        e,
+                        exc_info=True,
+                    )
+                    self._record_error(e, source=f"topic:{topic}")
+                    continue
+        finally:
+            if selector is not None:
+                selector.close()
     
     def _respond_topic_subscribe(self, rpc: PluginRPC, req: RequestTopicSubscribe) -> bool:
         """Handle topic subscribe request."""
@@ -896,7 +1283,7 @@ class PluginWorker:
             sub = self.topic_subscribers[topic].pop(plugin_id)
         
         try:
-            sub.queue.close()
+            sub.close()
         except Exception as e:
             logger.info(f"Error closing queue for topic '{topic}': {e}", exc_info=True)
 
@@ -904,5 +1291,6 @@ class PluginWorker:
     
     def _request_topic_list(self, rpc: PluginRPC, req: RequestTopicList) -> list:
         """Handle topic list request."""
-        return self.topic_published.copy()
+        with self._get_topic_lock():
+            return sorted(self.topic_published)
     

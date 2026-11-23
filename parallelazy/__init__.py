@@ -1,5 +1,5 @@
 """
-ModularNet Plugin System: Lightweight multiprocessing-based plugin architecture.
+parallelazy Plugin System: Lightweight multiprocessing-based plugin architecture.
 
 Provides modular plugin execution with pub/sub messaging, environment variables,
 and service invocation.
@@ -25,6 +25,7 @@ from parallelazy.plugin_data import (
     ProcessStatus,
     Queue,
     QueueDescriptor,
+    QueueReceive,
     QueueRecive,
     QueueSend,
     Request,
@@ -61,7 +62,6 @@ from parallelazy.plugin_rpc import (
 )
 from parallelazy.plugin_transport import (
     IpcEventCuda,
-    IpcEventPool,
     IpcEventPoolManaged,
     mark_graph_output,
     sanitize_for_ipc,
@@ -91,6 +91,7 @@ __all__ = [
     "ProcessStatus",
     "Queue",
     "QueueDescriptor",
+    "QueueReceive",
     "QueueRecive",
     "QueueSend",
     "Request",
@@ -125,7 +126,6 @@ __all__ = [
     "PluginTopicRPC",
     "PluginWorker",
     "IpcEventCuda",
-    "IpcEventPool",
     "IpcEventPoolManaged",
     "mark_graph_output",
     "sanitize_for_ipc",

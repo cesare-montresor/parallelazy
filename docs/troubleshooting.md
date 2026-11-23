@@ -36,9 +36,10 @@ broker.
 ## Environment callbacks do not arrive
 
 Subscribe with `env_subscribe(name, callback)` from the plugin, and make sure
-the writer uses the same exact key. The callback receives the new value. Use
-`env_get()` for an initial snapshot because subscribing does not itself
-replay the current value.
+the writer uses the same exact key. The callback receives the current value (or
+`None` if unset) on initial subscription, followed by each subsequent update in
+order. `env_get(name, default=...)` distinguishes an explicitly stored `None`
+from an unset key.
 
 ## RPC calls fail or time out
 
@@ -53,9 +54,11 @@ The package requests the `spawn` start method. Always protect application
 startup with `if __name__ == "__main__":`. Do not create manager/plugin
 processes as an import-time side effect.
 
-For worker debugging, construct the manager with
-`PluginManager(worker_pydebug=True)`. The worker uses `debugpy` and waits for
-a debugger client, so only enable this when a debugger is ready to attach.
+For worker debugging, attach the debugger to the manager before creating it;
+the manager detects the attached debugger and configures spawned workers. The
+worker waits for a debugger client by default without a deadline. Set
+`timeout_debugger_attach` on `PluginManager` to impose a finite attach timeout;
+`timeout_initialize` applies separately after the debugger attaches.
 
 ## Shutdown hangs or leaves processes
 

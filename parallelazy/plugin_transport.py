@@ -1,9 +1,11 @@
 import copy
+from collections import OrderedDict, defaultdict
+import dataclasses
 from dataclasses import dataclass
+import gc
 import logging
-from collections import OrderedDict
 import time
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch import cuda
@@ -11,6 +13,13 @@ import torch.nn as nn
 from torch.multiprocessing.reductions import reduce_tensor
 
 logger = logging.getLogger(__name__)
+
+
+def release_cuda_ipc() -> None:
+    """Release cached CUDA IPC handles if CUDA has been initialized in this process."""
+    if cuda.is_initialized():
+        gc.collect()
+        cuda.ipc_collect()
 
 
 def mark_graph_output(t: torch.Tensor) -> torch.Tensor:
@@ -24,13 +33,18 @@ def mark_graph_output(t: torch.Tensor) -> torch.Tensor:
 def _is_ipc_received(t: torch.Tensor) -> bool:
     """True if `t` sits on a CUDA storage that was itself received via IPC
     from another process (and therefore can't be re-shared as-is), OR if
-    it was pooled by a compiled graph."""
+    it was pooled by a compiled graph.
+
+    Note: PyTorch does not expose a dedicated Python flag for CUDA storages
+    opened via IPC handles, so for CUDA tensors we probe via `reduce_tensor(t)`
+    (CPU and graph-pooled tensors take the fast path above).
+    """
     if getattr(t, "_from_graph_pool", False):
         return True
 
     if not t.is_cuda:
         return False
-        
+
     try:
         reduce_tensor(t)
         return False
@@ -84,239 +98,217 @@ def _deepcopy_without_hooks(module: nn.Module) -> nn.Module:
                 setattr(m, name, val)
 
 
-def sanitize_for_ipc(obj):
+def _sanitize_recursive(obj: Any, memo: Dict[int, Any], has_tensor: list[bool]) -> Any:
+    if obj is None or isinstance(obj, (bool, int, float, str, bytes, bytearray)):
+        return obj
+
+    if isinstance(obj, torch.Tensor):
+        has_tensor[0] = True
+        return obj.clone() if _is_ipc_received(obj) else obj
+
+    if isinstance(obj, nn.Module):
+        has_tensor[0] = True
+        return _deepcopy_without_hooks(obj) if _module_needs_clone(obj) else obj
+
+    obj_id = id(obj)
+    if obj_id in memo:
+        return memo[obj_id]
+
+    if isinstance(obj, OrderedDict):
+        rebuilt = OrderedDict()
+        memo[obj_id] = rebuilt
+        for k, v in obj.items():
+            rebuilt[k] = _sanitize_recursive(v, memo, has_tensor)
+        return rebuilt
+
+    if isinstance(obj, defaultdict):
+        rebuilt = defaultdict(obj.default_factory)
+        memo[obj_id] = rebuilt
+        for k, v in obj.items():
+            rebuilt[k] = _sanitize_recursive(v, memo, has_tensor)
+        return rebuilt
+
+    if isinstance(obj, dict):
+        rebuilt = {}
+        memo[obj_id] = rebuilt
+        for k, v in obj.items():
+            rebuilt[k] = _sanitize_recursive(v, memo, has_tensor)
+        return rebuilt
+
+    if isinstance(obj, list):
+        rebuilt = []
+        memo[obj_id] = rebuilt
+        for item in obj:
+            rebuilt.append(_sanitize_recursive(item, memo, has_tensor))
+        return rebuilt
+
+    if isinstance(obj, tuple):
+        if hasattr(obj, "_fields"):
+            # namedtuple
+            cloned = tuple(_sanitize_recursive(v, memo, has_tensor) for v in obj)
+            return type(obj)(*cloned)
+        cloned = [_sanitize_recursive(v, memo, has_tensor) for v in obj]
+        return type(obj)(cloned)
+
+    if isinstance(obj, set):
+        return {_sanitize_recursive(v, memo, has_tensor) for v in obj}
+
+    if isinstance(obj, frozenset):
+        return frozenset(_sanitize_recursive(v, memo, has_tensor) for v in obj)
+
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        memo[obj_id] = obj
+        changed: Dict[str, Any] = {}
+        for f in dataclasses.fields(obj):
+            old_val = getattr(obj, f.name)
+            new_val = _sanitize_recursive(old_val, memo, has_tensor)
+            if new_val is not old_val:
+                changed[f.name] = new_val
+        if not changed:
+            return obj
+        try:
+            init_changes = {
+                f.name: changed[f.name]
+                for f in dataclasses.fields(obj)
+                if f.name in changed and f.init
+            }
+            rebuilt = dataclasses.replace(obj, **init_changes)
+            for f in dataclasses.fields(obj):
+                if f.name in changed and not f.init:
+                    object.__setattr__(rebuilt, f.name, changed[f.name])
+        except Exception:
+            rebuilt = copy.copy(obj)
+            for name, val in changed.items():
+                object.__setattr__(rebuilt, name, val)
+        memo[obj_id] = rebuilt
+        return rebuilt
+
+    return obj
+
+
+def sanitize_for_ipc_with_info(obj: Any) -> tuple[Any, bool]:
+    """
+    Like `sanitize_for_ipc(obj)`, but returns `(sanitized_obj, has_tensor)` in a
+    single traversal so callers can avoid a second walk to detect tensors.
+    """
+    has_tensor = [False]
+    return _sanitize_recursive(obj, {}, has_tensor), has_tensor[0]
+
+
+def sanitize_for_ipc(obj: Any) -> Any:
     """
     Recursively return a version of `obj` safe to put on a
     torch.multiprocessing Pipe/Queue, cloning only when necessary.
 
       - torch.Tensor -> obj.clone() if IPC-received OR compiled-graph output
-      - nn.Module    -> deepcopy(obj) if any param/buffer needs cloning
-      - dict/list/tuple -> rebuilt recursively (payloads are usually dicts
-        of tensors)
+      - nn.Module    -> deepcopy(obj) (with hooks stripped) if any param/buffer needs cloning
+      - dict / OrderedDict / defaultdict / list / tuple / namedtuple / set / frozenset / dataclass
+        -> traversed recursively with cycle detection, preserving container types
       - anything else -> returned unchanged
     """
-    if obj is None:
-        return None
-
-    if isinstance(obj, torch.Tensor):
-        return obj.clone() if _is_ipc_received(obj) else obj
-
-    if isinstance(obj, nn.Module):
-        return _deepcopy_without_hooks(obj) if _module_needs_clone(obj) else obj
-
-    if isinstance(obj, dict):
-        return {k: sanitize_for_ipc(v) for k, v in obj.items()}
-
-    if isinstance(obj, (list, tuple)):
-        cloned = [sanitize_for_ipc(v) for v in obj]
-        return type(obj)(cloned) if isinstance(obj, tuple) else cloned
-
-    return obj
-
-
-
-
-class _IpcEventRingBuffer:
-    """
-    Fixed-size, round-robin pool of interprocess CUDA events for a single layer.
- 
-    Why a ring buffer instead of one reused event: a single shared
-    torch.cuda.Event(interprocess=True) can get re-armed by record() before
-    the downstream consumer (a different process, reading through the IPC
-    handle) has finished waiting on / reading the data associated with the
-    previous record() call. That's a race, not just a style issue.
- 
-    A ring buffer of N events gives the consumer up to N-1 steps of slack:
-    while we're recording event k, the consumer can still be draining event
-    k-1, k-2, ... To avoid unbounded growth (the original leaked-IPC-handle
-    bug), the buffer is preallocated once per layer and reused forever --
-    never grows past `size`.
- 
-    size=3 is a reasonable default: it tolerates a consumer that's briefly
-    one or two steps behind without giving it so much slack that the
-    dashboard reads badly stale activations. Raise it if the consumer proves
-    to be reliably more than 1-2 steps behind; lower it to 2 (the minimum
-    that's still safe) to reduce IPC handle count if fewer processes read
-    less frequently.
-    """
-    def __init__(self, size: int = 3):
-        self.size = size
-        self._events: List[cuda.Event] = [cuda.Event(interprocess=True) for _ in range(size)]
-        self._idx = 0
- 
-    def next(self) -> cuda.Event:
-        event = self._events[self._idx]
-        self._idx = (self._idx + 1) % self.size
-        return event
-
-
-
-
-class IpcEventPool:
-    """
-    Demand-grown, capped pool of interprocess CUDA events for a single layer.
- 
-    Why not a single reused event: a shared torch.cuda.Event(interprocess=True)
-    can get re-armed by record() before the downstream consumer (a different
-    process, reading through the IPC handle) has finished waiting on / reading
-    the data tied to the previous record() call. That's a race, not just a
-    style issue.
- 
-    Why not mint one per call: that's the original leaked-IPC-handle bug --
-    unbounded handle growth, thousands of live handles per epoch.
- 
-    This pool grows lazily instead of preallocating a fixed size: on each
-    next() call it looks for an existing slot whose recorded GPU work has
-    already completed (event.query() == True) and reuses that one; if none
-    are free it allocates a new event, up to `max_size`. Once `max_size` is
-    hit it falls back to round-robin reuse of the oldest slot and logs a
-    warning, rather than growing further (that would reintroduce the leak).
- 
-    IMPORTANT CAVEAT: event.query() only reports whether the *producer-side*
-    GPU work recorded up to that event has finished executing (i.e. `scores`
-    is fully computed) -- it does NOT confirm the downstream consumer has
-    finished reading the data through the IPC handle. There is no ack channel
-    here from the consumer back to the producer. So this is a heuristic that
-    avoids the worst case (re-arming work that isn't even done yet) but is
-    not a strict guarantee against a slow consumer racing a reused event. If
-    that matters for correctness (not just staleness), add an explicit
-    consumer -> producer ack (e.g. publish "consumed layer_id/step_id" and
-    only reuse an event once its consumption has been acked) instead of
-    relying on query() alone.
-    """
-    def __init__(self, max_size: int = 8):
-        self.max_size = max_size
-        self._events: List[cuda.Event] = []
-        self._rr_idx = 0  # round-robin cursor used only once max_size is hit
- 
-    def next(self, layer_id: str = "") -> cuda.Event:
-        # 1. Reuse a slot whose previously recorded work has completed.
-        for event in self._events:
-            if event.query():
-                return event
- 
-        # 2. No free slot -- grow if we're under the cap.
-        if len(self._events) < self.max_size:
-            event = cuda.Event(interprocess=True)
-            self._events.append(event)
-            return event
- 
-        # 3. At the cap and everything still appears busy: fall back to
-        # round-robin reuse of the oldest slot rather than growing further
-        # or blocking. This trades a bit of staleness risk for a hard bound
-        # on IPC handle count.
-        logger.warning(
-            f"IPC event pool for layer {layer_id!r} exhausted at max_size="
-            f"{self.max_size} with no free slots; reusing oldest event. "
-            f"Consider raising max_size or checking whether the consumer "
-            f"is falling behind."
-        )
-        event = self._events[self._rr_idx]
-        self._rr_idx = (self._rr_idx + 1) % self.max_size
-        return event
-
-
+    return _sanitize_recursive(obj, {}, [False])
 
 
 # =====================================================================
-# IPC event pool for the score-publishing pipeline.
-#
-# NOTE: earlier iterations of this file defined three different versions
-# of this idea in sequence (_IpcEventRingBuffer, a demand-grown
-# _IpcEventPool, then this paired-slot _IpcEventPool) without removing the
-# previous ones. Because the last two both used the class name
-# `_IpcEventPool`, the demand-grown version was silently shadowed and dead
-# -- the same failure mode as the duplicate `runtime_map` def caught
-# earlier in modularobserver.py. Only this final version remains below;
-# the other two were deleted rather than left as unused dead code.
+# IPC event pool for cross-process CUDA synchronization.
 # =====================================================================
 
 @dataclass
 class IpcEventCuda:
     ready: cuda.Event
     release: cuda.Event
+    _ack_seq: Optional[torch.Tensor] = None
+    _seq: int = 0
 
-    def record(self):
-        """Record the ready event on the producer's stream."""
+    def record(self) -> None:
+        """Record the ready event on the producer's current CUDA stream."""
         self.ready.record()
 
-    def wait(self):
-        """Blocks until the producer has recorded the ready event."""
+    def wait(self) -> None:
+        """Block until the producer's ready event has completed."""
         self.ready.synchronize()
 
-    def clear(self):
-        """Signals that the consumer has finished reading the data."""
+    def clear(self) -> None:
+        """Signal that the consumer has finished reading the data."""
         self.release.record()
+        if self._ack_seq is not None:
+            self._ack_seq[0] = self._seq
+
+    def is_cleared(self) -> bool:
+        """Return True once the consumer has called clear() for this generation and GPU work completed."""
+        if self._ack_seq is not None and int(self._ack_seq[0].item()) < self._seq:
+            return False
+        return self.release.query()
 
 
 class _IpcEventSlot:
     """
-    One reusable slot: a paired (producer, consumer) interprocess CUDA event.
- 
-    - produced_event: recorded by the producer right after `scores` is
-      computed. The consumer waits on this before reading.
-    - consumed_event: recorded by the CONSUMER, on its own stream, once it
-      has actually finished reading/using the data from this slot. This is
-      the piece a single-event design is missing: it's a real signal of
-      consumer progress instead of a proxy (query() on the producer's own
-      event only ever reflects producer-side GPU completion, which happens
-      almost immediately and tells us nothing about the consumer).
+    One reusable slot: a paired (producer, consumer) interprocess CUDA event
+    backed by a shared monotonic sequence counter.
+
+    CUDA events are level-triggered (`event.query()` is True before any
+    `record()` and stays True after completion). Pairing `consumed_event`
+    with a shared CPU sequence tensor ensures the producer only considers a
+    slot acknowledged once the consumer has called `clear()` for the current
+    generation AND the consumer's GPU stream has completed `consumed_event`.
     """
-    __slots__ = ("produced_event", "consumed_event", "produced_at")
- 
+    __slots__ = ("produced_event", "consumed_event", "ack_seq", "expected_seq", "produced_at")
+
     def __init__(self):
         self.produced_event = cuda.Event(interprocess=True)
         self.consumed_event = cuda.Event(interprocess=True)
+        self.ack_seq = torch.zeros(1, dtype=torch.int64).share_memory_()
+        self.expected_seq: int = 0
         self.produced_at: Optional[float] = None  # time.monotonic() of last use; None = never used
 
-    def to_event(self) -> IpcEventCuda:
-        """Return a simple pair of events for the producer to publish."""
-        return IpcEventCuda(ready=self.produced_event, release=self.consumed_event)
- 
+    def is_free(self) -> bool:
+        if self.produced_at is None:
+            return True
+        if int(self.ack_seq[0].item()) < self.expected_seq:
+            return False
+        return self.consumed_event.query()
+
+    def acquire(self, now: float) -> IpcEventCuda:
+        self.expected_seq += 1
+        self.produced_at = now
+        return IpcEventCuda(
+            ready=self.produced_event,
+            release=self.consumed_event,
+            _ack_seq=self.ack_seq,
+            _seq=self.expected_seq,
+        )
+
+
 class IpcEventPoolManaged:
     """
     Fixed-size, preallocated pool of paired producer/consumer event slots for
-    a single layer (or any single IPC-published stream that needs one).
- 
-    A slot is safe to reuse once `consumed_event.query()` is True -- meaning
-    the consumer has actually recorded it after finishing with the data, not
-    merely that our own GPU work finished. query()-ing only the producer's
-    own event can never tell you anything about the consumer, since GPU
-    compute for the published tensor finishes long before any cross-process
-    consumer has even opened the IPC handle -- that's why the ack exists.
- 
-    FAILSAFE: if a consumer crashes, hangs, or has a bug that skips recording
-    consumed_event, that slot's consumed_event.query() would never return
-    True and a naive pool would strand it forever -- with enough stuck slots
-    the pool starves completely. To guard against that, each slot tracks
-    produced_at (wall-clock time of its last use). If a slot is still unacked
-    after `stale_after_s` seconds, the pool reclaims it anyway and logs a
-    warning, so a consumer that forgets (or dies) can't permanently wedge the
-    pool. This is a bounded risk, not a guarantee: a genuinely slow but
-    still-alive consumer could theoretically be raced if it takes longer than
-    stale_after_s. Set stale_after_s comfortably above the consumer's
-    worst-case processing time.
+    a single IPC-published CUDA stream.
+
+    A slot is safe to reuse once the consumer has acknowledged the current
+    generation via `event.clear()` AND `consumed_event.query()` is True.
+
+    FAILSAFE: if a consumer crashes, hangs, or skips calling `clear()`, each
+    slot tracks `produced_at`. If a slot remains unacknowledged past
+    `stale_after_s`, the pool reclaims it and logs a warning so a dead
+    consumer cannot permanently wedge the pool.
     """
     def __init__(self, size: int = 4, stale_after_s: float = 30.0):
         self.size = size
         self.stale_after_s = stale_after_s
         self._slots: List[_IpcEventSlot] = [_IpcEventSlot() for _ in range(size)]
         self._rr_idx = 0
- 
+
     def acquire(self, stream_id: str = "") -> IpcEventCuda:
         now = time.monotonic()
- 
-        # 1. Prefer a slot that's either never been used, or whose consumer
-        # has genuinely finished with it (real ack, not a GPU-completion proxy).
+
+        # 1. Prefer a slot that has never been used or whose consumer has acked
+        # the current generation and finished GPU work on consumed_event.
         for slot in self._slots:
-            if slot.produced_at is None or slot.consumed_event.query():
-                slot.produced_at = now
-                return slot.to_event()
- 
-        # 2. Nothing acked yet: reclaim the oldest slot if it's past the
-        # staleness timeout, even without an ack. This is the failsafe --
-        # it bounds how long a stuck/crashed consumer can hold a slot
-        # hostage, at the cost of possibly racing a live-but-slow consumer.
+            if slot.is_free():
+                return slot.acquire(now)
+
+        # 2. Nothing acked yet: reclaim the oldest slot if it is past the
+        # staleness timeout.
         oldest = min(self._slots, key=lambda s: s.produced_at or 0.0)
         age = now - (oldest.produced_at or 0.0)
         if age >= self.stale_after_s:
@@ -324,16 +316,12 @@ class IpcEventPoolManaged:
                 f"IPC event slot for {stream_id!r} reclaimed after "
                 f"{age:.1f}s without a consumer ack (stale_after_s="
                 f"{self.stale_after_s}). Consumer may be stuck, crashed, or "
-                f"not recording consumed_event -- check the subscriber."
+                f"not calling event.clear() -- check the subscriber."
             )
-            oldest.produced_at = now
-            return oldest.to_event()
- 
-        # 3. Everything is busy and still within the staleness window: fall
-        # back to round-robin reuse without an ack. This can race a live but
-        # slow consumer; it exists only so we never block or grow past
-        # `size`. If this fires often, raise `size` rather than lowering
-        # stale_after_s.
+            return oldest.acquire(now)
+
+        # 3. Everything is busy within the staleness window: fall back to
+        # round-robin reuse so the producer never blocks or grows past `size`.
         logger.warning(
             f"IPC event pool for {stream_id!r} exhausted (size={self.size}); "
             f"reusing slot {self._rr_idx} without an ack. Consumer is "
@@ -341,25 +329,22 @@ class IpcEventPoolManaged:
         )
         slot = self._slots[self._rr_idx]
         self._rr_idx = (self._rr_idx + 1) % self.size
-        slot.produced_at = now
-        return slot.to_event()
- 
+        return slot.acquire(now)
+
     def has_busy(self) -> bool:
-        return any(
-            s.produced_at is not None and not s.consumed_event.query()
-            for s in self._slots
-        )
+        return any(not s.is_free() for s in self._slots)
 
     def wait_all_free(self, timeout: float = 30.0, poll_s: float = 0.005) -> bool:
-        """Attende l'ack del consumer su tutti gli slot. Non reclama slot stale."""
+        """Wait for consumer acknowledgement on all slots. Does not reclaim stale slots."""
         deadline = time.monotonic() + timeout
         while self.has_busy():
             if time.monotonic() > deadline:
-                busy = sum(
-                    1 for s in self._slots
-                    if s.produced_at is not None and not s.consumed_event.query()
+                busy = sum(1 for s in self._slots if not s.is_free())
+                logger.warning(
+                    "IPC event pool drain timed out: %d/%d slots still unacknowledged",
+                    busy,
+                    self.size,
                 )
-                logger.warning(f"drain timeout: {busy}/{self.size} slot senza ack")
                 return False
             time.sleep(poll_s)
         return True

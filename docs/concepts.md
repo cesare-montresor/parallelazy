@@ -173,6 +173,8 @@ worker's startup phase. The phase distinguishes debugger attachment from
 worker initialization; a worker waiting for a debugger is reported as
 `waiting_for_debugger`.
 
-Use manager logs and plugin-specific logging for diagnostics. A worker records
-exceptions raised by its loop in its error log; the lifecycle and RPC methods
-also report failures through their boolean/result contracts.
+Use manager logs and plugin-specific logging for diagnostics. Exceptions in
+`on_start()`, `main()`, `on_stop()`, topic/environment callbacks, and RPC
+handlers are recorded in the worker's error log (inspectable via
+`plugin_errors()`), invoke `on_error(error, source=...)`, and transition
+lifecycle failures (`on_start` / `main`) to `PluginState.ERROR`.

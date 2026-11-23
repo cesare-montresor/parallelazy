@@ -91,6 +91,7 @@ The complete runnable examples are in
 [examples/](examples/). For example:
 
 ```bash
-python -m examples.example_pubsub
-python -m examples.example_rpc_calls
+python -m examples.example_quickstart
+python -m examples.example_tensor_pipeline
+python -m examples.example_dynamic_orchestrator
 ```

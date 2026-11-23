@@ -26,8 +26,9 @@ from parallelazy.plugin_logging import (
     resolve_directory,
 )
 from parallelazy.plugin_rpc import PluginRPC, RequestEnvGetAll, RequestEnvUnsubscribe, RequestTopicAnnounce
-from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicSubscribe, RequestTopicUnsubscribe
-from parallelazy.plugin_data import  CommandType, PluginStartupPhase, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, Subscriber
+from parallelazy.plugin_transport import release_cuda_ipc, sanitize_for_ipc, sanitize_for_ipc_with_info
+from parallelazy.plugin_worker import PluginWorker, Queue, RequestPluginCall, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe
+from parallelazy.plugin_data import  CommandType, ENV_MISSING, PluginStartupPhase, ProcessStatus, RequestEnvGet, RequestEnvSet, RequestEnvSubscribe, PluginStatus, RequestPluginErrors, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, Subscriber
 from parallelazy.environment_manager import EnvironmentManager
 
 
@@ -112,7 +113,8 @@ class PluginManager:
         self.run_id = create_run_id()
         self.run_log_dir = os.path.join(self.log_dir, self.run_id)
         os.makedirs(self._work_dir, exist_ok=True)
-        os.makedirs(self.run_log_dir, exist_ok=True)
+        if write_logs:
+            os.makedirs(self.run_log_dir, exist_ok=True)
 
         self._logging = configure_manager_logging(
             os.path.join(self.run_log_dir, "manager.log"),
@@ -196,7 +198,8 @@ class PluginManager:
 
     def _update_log_dir(self, log_dir: str) -> None:
         run_log_dir = os.path.join(log_dir, self.run_id)
-        os.makedirs(run_log_dir, exist_ok=True)
+        if self.write_logs:
+            os.makedirs(run_log_dir, exist_ok=True)
         self._logging.set_log_file(os.path.join(run_log_dir, "manager.log"))
         self._log_dir = log_dir
         self.run_log_dir = run_log_dir
@@ -234,8 +237,14 @@ class PluginManager:
             else resolve_directory(descriptor.log_dir, work_dir)
         )
         run_log_dir = os.path.join(log_dir, self.run_id)
+        effective_write_logs = (
+            self.write_logs
+            if descriptor.write_logs is None
+            else descriptor.write_logs
+        )
         os.makedirs(work_dir, exist_ok=True)
-        os.makedirs(run_log_dir, exist_ok=True)
+        if effective_write_logs:
+            os.makedirs(run_log_dir, exist_ok=True)
         return PluginRuntimeSettings(
             work_dir=work_dir,
             log_dir=run_log_dir,
@@ -247,11 +256,8 @@ class PluginManager:
                 if descriptor.display_logs is None
                 else descriptor.display_logs
             ),
-            write_logs=(
-                self.write_logs
-                if descriptor.write_logs is None
-                else descriptor.write_logs
-            ),
+            write_logs=effective_write_logs,
+            timeout_request=self.timeout_request,
         )
 
 
@@ -385,7 +391,9 @@ class PluginManager:
             True if loaded successfully
         """
         plugin_id = descriptor.name
-        options = options or descriptor.options or {}
+        merged_options = dict(descriptor.options or {})
+        merged_options.update(options or {})
+        options = merged_options
 
         with self._plugins_lock:
             if plugin_id in self._plugins or plugin_id in self._loading_plugins:
@@ -396,15 +404,18 @@ class PluginManager:
         plugin_rpc = None
         process = None
         plugin_info = None
+        init_error_r = None
+        init_error_w = None
         loaded = False
         try:
             runtime_settings = self._plugin_runtime_settings(descriptor)
-            plugin_rpc = PluginRPC(plugin_id)
+            plugin_rpc = PluginRPC(plugin_id, timeout=self.timeout_request)
             self._init_plugin_rpc(plugin_rpc)
             worker_channel = plugin_rpc.channel.remote_descriptor()  # For worker to manager communication
             initialized = mp.Event()
             initialized.clear()  # Ensure not set
             startup_phase = mp.Value("i", PluginStartupPhase.NOT_STARTED)
+            init_error_r, init_error_w = mp.Pipe(duplex=False)
 
             # Spawn worker process
             process = mp.Process(
@@ -417,6 +428,7 @@ class PluginManager:
                     initialized,
                     runtime_settings,
                     startup_phase,
+                    init_error_w,
                 ),
                 name=f"plugin-{plugin_id}"
             )
@@ -434,6 +446,9 @@ class PluginManager:
                 self._plugins[plugin_id] = plugin_info
             
             process.start()
+            plugin_rpc.channel.close_remote()
+            init_error_w.close()
+            init_error_w = None
             is_ready = self._wait_for_worker_ready(
                 plugin_id,
                 process,
@@ -444,11 +459,25 @@ class PluginManager:
             # If the loop exited and is_ready is False, the process died before setting the event
             if not is_ready:
                 phase = PluginStartupPhase(startup_phase.value)
-                self.logger.error(
-                    "Plugin %s did not become ready (last phase=%s)",
-                    plugin_id,
-                    phase.name.lower(),
-                )
+                init_error = None
+                try:
+                    if init_error_r.poll(timeout=0.1):
+                        init_error = init_error_r.recv()
+                except Exception:
+                    init_error = None
+                if init_error:
+                    self.logger.error(
+                        "Plugin %s did not become ready (last phase=%s):\n%s",
+                        plugin_id,
+                        phase.name.lower(),
+                        init_error,
+                    )
+                else:
+                    self.logger.error(
+                        "Plugin %s did not become ready (last phase=%s)",
+                        plugin_id,
+                        phase.name.lower(),
+                    )
                 return False
 
             self.logger.info(f"Plugin {plugin_id} loaded")
@@ -459,6 +488,12 @@ class PluginManager:
             self.logger.error(f"Error loading plugin {descriptor}: {e}")
             return False
         finally:
+            for conn in (init_error_w, init_error_r):
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
             if not loaded:
                 if process is not None and process.pid is not None:
                     if process.is_alive():
@@ -486,12 +521,13 @@ class PluginManager:
         Returns:
             True if started successfully
         """
-        if plugin_id not in self._plugins:
+        with self._plugins_lock:
+            info = self._plugins.get(plugin_id)
+        if info is None:
             self.logger.error(f"Plugin {plugin_id} not loaded")
             return False
         
         try:
-            info = self._plugins[plugin_id]
             pending = info.rpc.plugin_start()
             res = pending.wait(timeout=self.timeout_start)
             if not res:
@@ -550,13 +586,14 @@ class PluginManager:
         Returns:
             True if stopped successfully
         """
-        if plugin_id not in self._plugins:
+        with self._plugins_lock:
+            info = self._plugins.get(plugin_id)
+        if info is None:
             return False
         
         try:
-            info = self._plugins[plugin_id]
-            if not info.process.is_alive(): return True  # Already stopped
-
+            if not info.process.is_alive():
+                return True  # Already stopped
 
             pending = info.rpc.plugin_stop()
             res = pending.wait(timeout=self.timeout_start)
@@ -586,16 +623,17 @@ class PluginManager:
             True if unloaded successfully
         """
         try:
-            self.disable_monitoring()
-            if plugin_id in self._plugins:
-                info = self._plugins[plugin_id]
-                if info.process.is_alive() and not info.stop_confirmed:
-                    self.stop_plugin(plugin_id)
-            
-            if plugin_id in self._plugins:
-                info = self._plugins[plugin_id]
+            with self._plugins_lock:
+                info = self._plugins.get(plugin_id)
+
+            if info is not None and info.process.is_alive() and not info.stop_confirmed:
+                self.stop_plugin(plugin_id)
+
+            with self._plugins_lock:
+                info = self._plugins.pop(plugin_id, None)
+
+            if info is not None:
                 process = info.process
-                
                 info.rpc.shutdown()  # Clean up RPC resources
 
                 process.join(timeout=self.timeout_start)
@@ -603,21 +641,18 @@ class PluginManager:
                 if process.is_alive():
                     process.terminate()
                     process.join(timeout=self.timeout_start)
-                    
+
                 if process.is_alive():
                     process.kill()
-                
+                    process.join(timeout=1.0)
+
                 self._cleanup_plugin_registrations(plugin_id)
-                
-                del self._plugins[plugin_id]
             
             self.logger.info(f"Plugin {plugin_id} unloaded")
             return True
             
         except Exception as e:
-            import traceback
-            dump = traceback.print_exc()
-            self.logger.error(f"Error unloading plugin {plugin_id}: {e}\n{dump}", stack_info=True)
+            self.logger.error(f"Error unloading plugin {plugin_id}: {e}", exc_info=True)
             return False
 
     def _cleanup_plugin_registrations(self, plugin_id: str) -> None:
@@ -629,7 +664,9 @@ class PluginManager:
                     del self._env_subscribers[env]
 
             for topic, plugins in list(self._topic_subscribers.items()):
-                plugins.pop(plugin_id, None)
+                removed = plugins.pop(plugin_id, None)
+                if removed is not None:
+                    removed.close()
                 if not plugins:
                     del self._topic_subscribers[topic]
 
@@ -654,12 +691,26 @@ class PluginManager:
     def unload_all_plugins(self) -> None:
         """Shut down the plugin manager and all plugins."""
         self.disable_monitoring()
+        release_cuda_ipc()
         self.stop_all_plugins()
         with self._plugins_lock:
             plugin_ids = list(self._plugins.keys())
         for plugin_id in plugin_ids:
             self.unload_plugin(plugin_id)
         self.shutdown_env_dispatcher()
+        release_cuda_ipc()
+        if getattr(self, "_logging", None) is not None:
+            self._logging.close()
+
+    def close(self) -> None:
+        """Shut down all plugins and release manager resources."""
+        self.unload_all_plugins()
+
+    def __enter__(self) -> "PluginManager":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
     # ========================================================================
     # Utility Methods for Plugin Management
@@ -729,6 +780,51 @@ class PluginManager:
         """List all loaded plugin IDs."""
         with self._plugins_lock:
             return list(self._plugins.keys())
+
+    def plugin_call(
+        self,
+        plugin_id: str,
+        method_name: str,
+        *args,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> Any:
+        """Invoke a method on a loaded plugin via RPC."""
+        with self._plugins_lock:
+            info = self._plugins.get(plugin_id)
+        if info is None:
+            raise ValueError(f"Plugin {plugin_id} not found")
+
+        effective_timeout = self.timeout_request if timeout is None else timeout
+        pending = info.rpc.plugin_call(plugin_id, method_name, *args, **kwargs)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None:
+            raise TimeoutError(
+                f"Timed out calling '{method_name}' on plugin '{plugin_id}' after {effective_timeout}s"
+            )
+        if response.error:
+            raise RuntimeError(
+                f"Error calling '{method_name}' on plugin '{plugin_id}': {response.error}"
+            )
+        return response.result
+
+    def plugin_errors(
+        self,
+        plugin_id: str,
+        timeout: Optional[float] = None,
+    ) -> List[str]:
+        """Return recorded error messages for a loaded plugin."""
+        with self._plugins_lock:
+            info = self._plugins.get(plugin_id)
+        if info is None or not info.process.is_alive():
+            return []
+
+        effective_timeout = self.timeout_request if timeout is None else timeout
+        pending = info.rpc.plugin_errors(plugin_id)
+        response = pending.wait(timeout=effective_timeout)
+        if response is None or response.error:
+            return []
+        return list(response.result or [])
 
     def enable_monitoring(
         self,
@@ -823,7 +919,8 @@ class PluginManager:
     # Environment Variable Management
     # ========================================================================
 
-    def env_set(self, name:str, value:Any) -> None:
+    def env_set(self, name:str, value:Any) -> bool:
+        value = sanitize_for_ipc(value)
         self._env.set(name, value)
         self._env_update_queue.put((name, value))
         return True
@@ -893,7 +990,7 @@ class PluginManager:
     # Service Management (Optional, for future extension)
     # ========================================================================
 
-    def topic_publish(self, topic: str, data: Any):
+    def topic_publish(self, topic: str, data: Any) -> int:
         """
         Publish data to a topic.
         
@@ -904,21 +1001,43 @@ class PluginManager:
         Returns:
             Number of subscribers that received the message
         """
-        
+        data, has_tensor = sanitize_for_ipc_with_info(data)
         with self._plugins_lock:
-            subscribers = tuple(self._topic_subscribers.get(topic, {}).values())
+            subscribers = list(self._topic_subscribers.get(topic, {}).items())
 
-        for subscriber in subscribers:
-            try:
-                subscriber.queue.put_nowait(data)
-            except Exception as e:
-                self.logger.debug(f"Failed to deliver to topic '{topic}': {e}")
-        
-        return True
+        if not subscribers:
+            return 0
 
-    def topic_list(self) -> List[str]:
+        from parallelazy.plugin_worker import _deliver_to_subscribers
+        delivered, dead_ids = _deliver_to_subscribers(
+            topic, data, subscribers, self.logger, has_tensor=has_tensor
+        )
+
+        if dead_ids:
+            with self._plugins_lock:
+                topic_subs = self._topic_subscribers.get(topic)
+                if topic_subs is not None:
+                    for sub_id in dead_ids:
+                        removed = topic_subs.pop(sub_id, None)
+                        if removed is not None:
+                            removed.close()
+                    if not topic_subs:
+                        del self._topic_subscribers[topic]
+
+        return delivered
+
+    def topic_list(self, plugin_id: Optional[str] = None) -> List[str]:
         with self._plugins_lock:
-            return list(self._topic_subscribers.keys())
+            if plugin_id is None:
+                return sorted(
+                    set(self._topic_publishers.keys())
+                    | set(self._topic_subscribers.keys())
+                )
+            return sorted(
+                topic
+                for topic, pub in self._topic_publishers.items()
+                if pub == plugin_id
+            )
 
     # ========================================================================
     # PLUGIN Lifecycle
@@ -961,6 +1080,7 @@ class PluginManager:
         plugin_rpc.on_request(CommandType.PLUGIN_CALL, self._respond_call)  # forward
         plugin_rpc.on_request(CommandType.PLUGIN_STATUS, self._respond_plugin_status)
         plugin_rpc.on_request(CommandType.PLUGIN_STATUS_ALL, self._respond_plugin_status_all)
+        plugin_rpc.on_request(CommandType.PLUGIN_ERRORS, self._respond_plugin_errors)
 
         plugin_rpc.on_request(CommandType.ENV_SET, self._respond_env_set)
         plugin_rpc.on_request(CommandType.ENV_GET, self._respond_env_get)
@@ -1006,8 +1126,9 @@ class PluginManager:
             raise ValueError("plugin_id is required")
         if req.plugin_id == rpc.plugin_id:
             raise ValueError("A plugin cannot unload itself through lifecycle RPC")
-        if req.plugin_id not in self._plugins:
-            return False
+        with self._plugins_lock:
+            if req.plugin_id not in self._plugins:
+                return False
         return self.unload_plugin(req.plugin_id)
 
     def _respond_plugin_status(self, rpc: PluginRPC, req: RequestPluginStatus) -> Optional[ProcessStatus]:
@@ -1018,17 +1139,20 @@ class PluginManager:
         """Return the status of every loaded plugin."""
         return self.plugin_status_all()
 
+    def _respond_plugin_errors(self, rpc: PluginRPC, req: RequestPluginErrors) -> List[str]:
+        """Return recorded error messages for the requested plugin."""
+        return self.plugin_errors(req.plugin_id or req.sender)
+
 
     # ========================================================================
 
     def _respond_call(self, rpc: PluginRPC, req: RequestPluginCall) -> Any:
-        
-        if req.plugin_id not in self._plugins:
+        with self._plugins_lock:
+            info = self._plugins.get(req.plugin_id)
+        if info is None:
             raise ValueError(f"Plugin {req.plugin_id} not found")
         
-        dst_rpc = self._plugins[req.plugin_id].rpc
-        remote_result = dst_rpc.forward(req)
-        
+        remote_result = info.rpc.forward(req)
         return remote_result
     
     # ========================================================================
@@ -1039,7 +1163,7 @@ class PluginManager:
         return self.env_set(req.name, req.value)
     
     def _respond_env_get(self, rpc: PluginRPC, req: RequestEnvGet) -> Any:
-        return self.env_get(req.name)
+        return self._env.get(req.name, ENV_MISSING)
     
     def _respond_env_get_all(self, rpc: PluginRPC, req: RequestEnvGetAll) -> Dict[str, Any]:
         return self.env_get()
@@ -1060,85 +1184,102 @@ class PluginManager:
         Subscribe a plugin to a topic.
         Allow subscription also for non (yet, hopefully) existing topics.
         """
-        
-        sub  = req.subscriber
+        sub = req.subscriber
         topic = sub.topic
         plugin_sub = req.sender
+        forward_rpc = None
 
         with self._plugins_lock:
-            if plugin_sub not in self._plugins: return False
+            if plugin_sub not in self._plugins:
+                sub.close()
+                return False
 
-            plugin_pub = self._topic_publishers.get(topic,None)
-            if plugin_pub is not None and plugin_pub not in self._plugins: return False
+            plugin_pub = self._topic_publishers.get(topic, None)
+            if plugin_pub is not None:
+                pub_info = self._plugins.get(plugin_pub)
+                if pub_info is None:
+                    sub.close()
+                    return False
+                forward_rpc = pub_info.rpc
 
             if topic not in self._topic_subscribers:
                 self._topic_subscribers[topic] = {}
 
-            if plugin_sub not in self._topic_subscribers[topic]:
-                self._topic_subscribers[topic][plugin_sub] = sub
+            previous = self._topic_subscribers[topic].get(plugin_sub)
+            if previous is not None and previous is not sub:
+                previous.close()
+            self._topic_subscribers[topic][plugin_sub] = sub
 
         remote_result = True  # Default to success
 
-        if plugin_pub is not None:
-            forward_rpc = self._plugins[plugin_pub].rpc
-            remote_result = forward_rpc.forward(req)
-            self.logger.debug(f"topic_subscribe: {remote_result}" )
+        if forward_rpc is not None:
+            try:
+                remote_result = forward_rpc.forward(req)
+                self.logger.debug(f"topic_subscribe: {remote_result}")
+            except Exception as e:
+                self.logger.error(
+                    "Failed to forward topic_subscribe for '%s' to publisher '%s': %s",
+                    topic,
+                    plugin_pub,
+                    e,
+                )
+                remote_result = False
 
         if not remote_result:
             with self._plugins_lock:
                 subscribers = self._topic_subscribers.get(topic)
                 if subscribers is not None:
-                    subscribers.pop(plugin_sub, None)
+                    removed = subscribers.pop(plugin_sub, None)
+                    if removed is not None:
+                        removed.close()
                     if not subscribers:
                         del self._topic_subscribers[topic]
             return False
 
-
-        
         return True
 
 
     def _respond_topic_unsubscribe(self, rpc: PluginRPC, req: RequestTopicUnsubscribe) -> bool:
         """
         Unsubscribe a plugin from a topic.
-        
-        Args:
-            plugin_id: Plugin identifier
-            topic: Topic name
-        
-        Returns:
-            True if unsubscription successful
         """
-        sub  = req.subscriber
+        sub = req.subscriber
         topic = sub.topic
         src_id = sub.plugin_id
+        forward_rpc = None
 
         with self._plugins_lock:
-            if src_id not in self._plugins: return False
-            if topic not in self._topic_publishers: return True
+            if src_id not in self._plugins:
+                return False
 
-            dst_id = self._topic_publishers[topic]
-
-        forward_rpc = self._plugins[dst_id].rpc
-        remote_result = forward_rpc.forward(req)
-
-        if not remote_result: return False
-        
-
-        with self._plugins_lock:
             subscribers = self._topic_subscribers.get(topic)
             if subscribers is not None:
-                subscribers.pop(src_id, None)
+                removed = subscribers.pop(src_id, None)
+                if removed is not None:
+                    removed.close()
                 if not subscribers:
                     del self._topic_subscribers[topic]
 
+            dst_id = self._topic_publishers.get(topic)
+            if dst_id is not None and dst_id in self._plugins:
+                forward_rpc = self._plugins[dst_id].rpc
+
+        if forward_rpc is not None:
+            try:
+                remote_result = forward_rpc.forward(req)
+                return bool(remote_result)
+            except Exception as e:
+                self.logger.warning(
+                    "Failed to forward topic_unsubscribe for '%s' to publisher: %s",
+                    topic,
+                    e,
+                )
 
         return True
 
     def _respond_topic_announce(self, rpc: PluginRPC, req: RequestTopicAnnounce) -> Dict[str, Subscriber]:
         """
         Announce a new topic.
-        
         """
         with self._plugins_lock:
             self._topic_publishers[req.topic] = req.sender
@@ -1147,5 +1288,5 @@ class PluginManager:
                 self._topic_subscribers[req.topic] = {}
             return dict(self._topic_subscribers[req.topic])
 
-    def _respond_topic_list(self) -> List[str]:
-        return self.topic_list()
+    def _respond_topic_list(self, rpc: PluginRPC, req: RequestTopicList) -> List[str]:
+        return self.topic_list(plugin_id=req.plugin_id)

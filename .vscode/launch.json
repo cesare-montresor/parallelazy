@@ -5,52 +5,45 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug Example: Configuration",
+            "name": "Debug Example: Quickstart",
             "type": "debugpy",
             "request": "launch",
-            "program": "examples/example_configuration.py",
+            "module": "examples.example_quickstart",
             "console": "integratedTerminal"
         },
         {
-            "name": "Debug Example: Environment Variables",
+            "name": "Debug Example: Tensor Pipeline",
             "type": "debugpy",
             "request": "launch",
-            "program": "examples/example_env_variables.py",
+            "module": "examples.example_tensor_pipeline",
             "console": "integratedTerminal"
         },
         {
-            "name": "Debug Example: Error Handling",
+            "name": "Debug Example: Live Config",
             "type": "debugpy",
             "request": "launch",
-            "program": "examples/example_error_handling.py",
+            "module": "examples.example_live_config",
             "console": "integratedTerminal"
         },
         {
-            "name": "Debug Example: Graceful Shutdown",
+            "name": "Debug Example: Dynamic Orchestrator",
             "type": "debugpy",
             "request": "launch",
-            "program": "examples/example_graceful_shutdown.py",
+            "module": "examples.example_dynamic_orchestrator",
             "console": "integratedTerminal"
         },
         {
-            "name": "Debug Example: Pub/Sub Communication",
+            "name": "Debug Example: Resilience and Errors",
             "type": "debugpy",
             "request": "launch",
-            "program": "examples/example_pubsub.py",
+            "module": "examples.example_resilience_and_errors",
             "console": "integratedTerminal"
         },
         {
-            "name": "Debug Example: RPC Calls",
+            "name": "Debug Example: CUDA Zero Copy",
             "type": "debugpy",
             "request": "launch",
-            "program": "examples/example_rpc_calls.py",
-            "console": "integratedTerminal"
-        },
-        {
-            "name": "Debug Example: Worker Pool Management",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "examples/example_worker_pool.py",
+            "module": "examples.example_cuda_zero_copy",
             "console": "integratedTerminal"
         }
     ]

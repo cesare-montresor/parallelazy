@@ -52,13 +52,38 @@ ResponseCallback = Callable[["PluginRPC","Response"], Any]
 
 
 
+class _TopicShutdownSentinel:
+    """Private sentinel used to stop topic listener threads cleanly."""
+    pass
+
+
+_TOPIC_SHUTDOWN_SENTINEL = _TopicShutdownSentinel()
+
+
+class _EnvMissing:
+    """Sentinel indicating an environment key is not set (distinct from stored None)."""
+    pass
+
+
+ENV_MISSING = _EnvMissing()
+
+
 class QueueDescriptor:
-    """Descriptor for holding 2 connections, read/write repesenting a queue made with pipes."""
-    def __init__(self, send: Connection, recieve: Connection):
+    """Descriptor for holding read/write connections representing a pipe-backed queue."""
+    def __init__(
+        self,
+        send: Optional[Connection] = None,
+        receive: Optional[Connection] = None,
+        *,
+        recieve: Optional[Connection] = None,
+    ):
         self.send = send
-        self.receive = recieve
+        self.receive = receive if receive is not None else recieve
     
-    def __str__(self): return f"QueueDescriptor(send_closed={self.send.closed()}, receive_closed={self.receive.closed()})"
+    def __str__(self):
+        send_closed = self.send.closed if self.send is not None else None
+        receive_closed = self.receive.closed if self.receive is not None else None
+        return f"QueueDescriptor(send_closed={send_closed}, receive_closed={receive_closed})"
         
 
 
@@ -70,11 +95,11 @@ class Queue:
     def __init__(self, descriptor: QueueDescriptor = None):
         if descriptor is None:
             receive, send = mp.Pipe(duplex=False)
+            self._send = QueueSend(send)
+            self._receive = QueueReceive(receive)
         else:
-            receive, send = descriptor.receive, descriptor.send
-
-        self._send = QueueSend(send)
-        self._receive = QueueRecive(receive)
+            self._send = QueueSend(descriptor.send) if descriptor.send is not None else None
+            self._receive = QueueReceive(descriptor.receive) if descriptor.receive is not None else None
 
     @property
     def sender(self):
@@ -85,27 +110,62 @@ class Queue:
         return self._receive
     
     def closed(self):
-        return self._send._conn.closed or self._receive._conn.closed
+        send_closed = self._send._conn.closed if self._send is not None else True
+        recv_closed = self._receive._conn.closed if self._receive is not None else True
+        if self._send is not None and self._receive is not None:
+            return send_closed or recv_closed
+        return send_closed and recv_closed
     
     def put(self, item):
+        if self._send is None:
+            raise ValueError("Queue has no send end")
         self._send.put(item)
 
     def put_nowait(self, item):
-        self._send.put(item)
+        self.put(item)
+
+    def send_bytes(self, data: bytes):
+        if self._send is None:
+            raise ValueError("Queue has no send end")
+        self._send.send_bytes(data)
     
     def get(self):
+        if self._receive is None:
+            raise ValueError("Queue has no receive end")
         return self._receive.get()
     
     def get_nowait(self):
-        return self._receive.get()
+        return self.get()
+
+    def close_sender(self):
+        if self._send is not None:
+            try:
+                self._send.close()
+            except Exception:
+                pass
+            self._send = None
 
     def close(self):
-        self._send.put(None)  # Send a sentinel to indicate closure
-        self._send.close()
-        self._receive.close()
+        self.close_sender()
+        if self._receive is not None:
+            try:
+                self._receive.close()
+            except Exception:
+                pass
+            self._receive = None
 
     def descriptor(self):
-        return QueueDescriptor(self._send._conn, self._receive._conn)
+        return QueueDescriptor(
+            send=self._send._conn if self._send is not None else None,
+            receive=self._receive._conn if self._receive is not None else None,
+        )
+
+    def send_descriptor(self):
+        """Return a descriptor containing only the write end of the pipe."""
+        return QueueDescriptor(
+            send=self._send._conn if self._send is not None else None,
+            receive=None,
+        )
 
 
 class QueueSend:
@@ -117,11 +177,15 @@ class QueueSend:
         with self._lock:
             self._conn.send(item)
 
+    def send_bytes(self, data: bytes):
+        with self._lock:
+            self._conn.send_bytes(data)
+
     def close(self):
         self._conn.close()
 
 
-class QueueRecive:
+class QueueReceive:
     def __init__(self, conn: Connection):
         self._conn = conn
 
@@ -130,6 +194,10 @@ class QueueRecive:
 
     def close(self):
         self._conn.close()
+
+
+# Backwards-compatible alias for the legacy misspelled name.
+QueueRecive = QueueReceive
 
 class Channel:
     """
@@ -142,12 +210,12 @@ class Channel:
             r1, w1 = mp.Pipe(duplex=False)
             r2, w2 = mp.Pipe(duplex=False)
             self._send = QueueSend(w1)
-            self._receive = QueueRecive(r2)
+            self._receive = QueueReceive(r2)
             self._remote_send = QueueSend(w2)
-            self._remote_receive = QueueRecive(r1)
+            self._remote_receive = QueueReceive(r1)
         else:
             self._send = QueueSend(descriptor.send)
-            self._receive = QueueRecive(descriptor.receive)
+            self._receive = QueueReceive(descriptor.receive)
             self._remote_send = None
             self._remote_receive = None
 
@@ -167,15 +235,21 @@ class Channel:
         """Receive a message, blocking until one arrives or the pipe closes."""
         return self._receive.get()
 
+    def close_remote(self) -> None:
+        """Close the remote pipe ends after handing them to the child process."""
+        if self._remote_send is not None:
+            self._remote_send.close()
+            self._remote_send = None
+        if self._remote_receive is not None:
+            self._remote_receive.close()
+            self._remote_receive = None
+
     def shutdown(self):
         if self._send:
             self._send.close()
         if self._receive:
             self._receive.close()
-        if self._remote_send:
-            self._remote_send.close()
-        if self._remote_receive:
-            self._remote_receive.close()
+        self.close_remote()
 
 
 # ============================================================================
@@ -266,10 +340,16 @@ class Response(Message):
     error: Optional[str] = None
 
 class PendingRequest():
-    def __init__(self, message_id: str, callback: Callable=None):
+    def __init__(
+        self,
+        message_id: str,
+        callback: Callable = None,
+        on_timeout: Optional[Callable[[str], None]] = None,
+    ):
         super().__init__()
         self.future = Future()
         self.message_id = message_id
+        self._on_timeout = on_timeout
         if callback:
             self.future.add_done_callback(callback)
 
@@ -279,16 +359,26 @@ class PendingRequest():
     def set_result(self, result: Response|Any):
         if not isinstance(result, Response):
             result = Response(message_id=self.message_id, result=result)
-        self.future.set_result(result)
+        if not self.future.done():
+            try:
+                self.future.set_result(result)
+            except Exception:
+                pass
 
     def set_error(self, error: str|Exception|Any):
-        self.future.set_result(Response(message_id=self.message_id, error=str(error)))
+        if not self.future.done():
+            try:
+                self.future.set_result(Response(message_id=self.message_id, error=str(error)))
+            except Exception:
+                pass
 
     def wait(self, timeout=None) -> None | Response:
         try:
             result: Response = self.future.result(timeout=timeout)
             return result
         except TimeoutError:
+            if self._on_timeout is not None:
+                self._on_timeout(self.message_id)
             return None
         
     def __hash__(self):
@@ -304,6 +394,35 @@ class Subscription:
         self.callback = callback
         self.queue = queue or Queue()  # For topic subscriptions, queue to receive data
         self.thread: Optional[threading.Thread] = thread  # Thread handling this subscription (if needed)
+        self._wakeup_r, self._wakeup_w = mp.Pipe(duplex=False)
+        self._wakeup_lock = threading.Lock()
+        self._stopped = False
+
+    def signal_stop(self) -> None:
+        """Wake the listener thread without writing to the topic data pipe."""
+        with self._wakeup_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            try:
+                if not self._wakeup_w.closed:
+                    self._wakeup_w.send_bytes(b"1")
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        """Signal stop and close both wakeup and topic pipe handles."""
+        self.signal_stop()
+        try:
+            self.queue.close()
+        except Exception:
+            pass
+        for conn in (self._wakeup_w, self._wakeup_r):
+            try:
+                if not conn.closed:
+                    conn.close()
+            except Exception:
+                pass
 
 class Subscriber:
     """Represents a subscriber to a topic or environment variable."""
@@ -322,6 +441,21 @@ class Subscriber:
     @queue.setter
     def queue(self, value: Queue):
         self._queue = value
+
+    def close(self) -> None:
+        if self._queue is not None:
+            try:
+                self._queue.close()
+            except Exception:
+                pass
+        elif self.queue_descriptor is not None:
+            for conn in (self.queue_descriptor.send, self.queue_descriptor.receive):
+                if conn is not None:
+                    try:
+                        if not conn.closed:
+                            conn.close()
+                    except Exception:
+                        pass
     
 
     def __str__(self):

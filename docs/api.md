@@ -30,16 +30,20 @@ console_format=None)` changes the formats for this plugin worker only.
 
 ### Communication methods
 
-- `topic_subscribe(topic, callback)`
-- `topic_publish(topic, data)`
-- `env_set(name, value, wait=True)`
-- `env_get(name=None, default=None)`
-- `env_subscribe(name, callback)`
+- `topic_subscribe(topic, callback) -> bool`
+- `topic_unsubscribe(topic) -> bool`
+- `topic_publish(topic, data) -> int` (returns the number of subscribers that received the payload)
+- `topic_list(plugin_id=None) -> list[str]` (sorted list of all known topics, or topics published by `plugin_id`)
+- `env_set(name, value, wait=True) -> bool`
+- `env_get(name=None, default=None)` (distinguishes stored `None` from unset keys)
+- `env_subscribe(name, callback) -> bool`
+- `env_unsubscribe(name) -> bool`
 - `plugin_call(plugin_id, method_name, *args, **kwargs)`
-- `plugin_load(descriptor, options=None)` loads a new plugin instance.
-- `plugin_start(plugin_id)` starts another loaded plugin.
-- `plugin_stop(plugin_id)` stops another loaded plugin.
-- `plugin_unload(plugin_id)` stops and removes another plugin.
+- `plugin_errors(plugin_id=None) -> list[str]`
+- `plugin_load(descriptor, options=None) -> bool` loads a new plugin instance.
+- `plugin_start(plugin_id) -> bool` starts another loaded plugin.
+- `plugin_stop(plugin_id) -> bool` stops another loaded plugin.
+- `plugin_unload(plugin_id) -> bool` stops and removes another plugin.
 
 Callbacks are normally bound methods and must accept the delivered payload
 (one argument for topic and environment callbacks).
@@ -156,9 +160,10 @@ The manager resolves `work_dir` to the current directory when omitted and
 resolves a relative `log_dir` under it. A unique run folder is created below
 the log directory. It contains `manager.log` and one log file per plugin.
 Descriptor values override the corresponding manager defaults for that plugin.
-Set `write_logs=False` to disable manager and plugin file handlers. Set
-`display_logs=False` separately to suppress worker and logger terminal output;
-captured worker `print()` calls may still be written to plugin files.
+Set `write_logs=False` to disable manager and plugin file handlers (no log files
+or log directories are created). Set `display_logs=False` separately to suppress
+worker and logger terminal output; captured worker `print()` calls may still be
+written to plugin files when `write_logs=True`.
 File and console output use the effective log level; console output is enabled
 by default. The manager and plugins can independently change their process's
 formats with `set_log_formats(file_format=None, console_format=None)`.
@@ -180,12 +185,17 @@ begins.
 | `start_all_plugins()` | `dict[str, bool]` |
 | `stop_all_plugins()` | `None` |
 | `unload_all_plugins()` | `None` |
+| `close()` | `None` |
 
-### Inspection
+`PluginManager` also supports the context-manager protocol (`with PluginManager() as manager:`), calling `close()` on exit to stop and unload all plugins, stop monitoring, and close log handlers.
+
+### Inspection and RPC
 
 - `plugin_list()` returns loaded plugin IDs.
 - `plugin_status(plugin_id)` returns a `ProcessStatus` or `None`.
 - `plugin_status_all()` returns a mapping of IDs to `ProcessStatus`.
+- `plugin_call(plugin_id, method_name, *args, timeout=None, **kwargs)` invokes a method on a loaded plugin via RPC.
+- `plugin_errors(plugin_id, timeout=None)` returns recorded error messages for a loaded plugin.
 - `ProcessStatus.startup_phase` reports the worker milestone as a string:
   `not_started`, `process_started`, `waiting_for_debugger`, `initializing`,
   `ready`, or `failed`.
@@ -206,8 +216,8 @@ to inspect all loaded plugins.
 - `env_get(name=None, default=None)`
 - `env_subscribe(plugin_id, var_name)`
 - `env_unsubscribe(plugin_id, var_name)`
-- `topic_publish(topic, data)`
-- `topic_list()`
+- `topic_publish(topic, data) -> int`
+- `topic_list(plugin_id=None) -> list[str]`
 
 Manager-side subscriptions are useful for registering routing state; plugin
 code normally uses the corresponding methods on `Plugin`.
