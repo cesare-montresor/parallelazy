@@ -1,5 +1,5 @@
 ## Keeping this file current
-Last synced: 1fc8b7947c760c7a5bfc556f5391e67837c00353
+Last synced: 0b2b20a8c0aa93b61755a945af0ecc6de1c138b9
 
 At the start of every session:
 1. Find commits since the last sync: `git log --oneline <Last synced hash>..HEAD`
@@ -60,21 +60,27 @@ At the end of every session:
 - Stop waits for an in-progress start, accepted RPC handlers, and active callbacks before
   `on_stop()`. Preserve this ordering and response-drain behavior when changing lifecycle code.
 - The manager owns the shared in-memory environment. Environment updates are dispatched
-  asynchronously to subscribers; subscription does not replay the current value.
-- Topics are live fan-out through per-subscriber pipe-backed queues: no durable backlog or
-  replay. Register subscribers before publishing if the first message matters.
-- `sanitize_for_ipc()` recursively handles containers and clones IPC-received or
-  graph-pooled tensors before re-sharing; `mark_graph_output()` marks compiled-graph outputs.
-- Monitoring is optional and read-only; topic backlog is measured as pending pipe bytes,
-  not by reading payloads. Process/GPU metrics depend on optional `psutil`/NVML packages.
+  asynchronously to subscribers; `env_subscribe()` delivers the initial value before
+  subsequent updates, and `env_get()` distinguishes stored `None` from unset keys.
+- Topics are live fan-out through per-subscriber pipe-backed queues with strict pipe
+  ownership (subscriber owns read end; manager/publisher own write end). No durable backlog
+  or replay; register subscribers before publishing if the first message matters.
+- `sanitize_for_ipc()` recursively handles containers (with cycle detection) and clones
+  IPC-received or graph-pooled tensors before re-sharing; `mark_graph_output()` marks
+  compiled-graph outputs.
+- Monitoring is optional and read-only; topic backlog is measured as pending pipe bytes on
+  the write end (`FIONREAD`), not by reading payloads. Process/GPU metrics depend on optional
+  `monitoring` extras (`psutil`, `nvidia-ml-py`).
 - Manager and plugin logs share a run ID. Set `work_dir`/`log_dir` before plugin loading;
-  manager path changes are rejected after loading starts.
+  manager path changes are rejected after loading starts. `write_logs=False` creates no log
+  directories or files.
 - `pyproject.toml` requires Python 3.11+; PyTorch and NumPy are the declared runtime
-  dependencies. `debugpy` is supplied by VS Code for the companion integration, not packaged.
+  dependencies, with `monitoring` optional extras. `debugpy` is supplied by VS Code for the
+  companion integration, not packaged.
 
 ## Commands
 - Run example: `.venv/bin/python -m examples.example_count` (verified).
-- Test: `.venv/bin/python -m unittest discover -s tests` (verified; 38 tests passed).
+- Test: `.venv/bin/python -m unittest discover -s tests` (verified; 68 tests passed).
 - Build distributions: `.venv/bin/python -m build` (verified).
 - Lint: no lint command/configuration is defined in this repository.
 - Debug: select a `Debug Example: ...` configuration in `.vscode/launch.json`.
@@ -83,9 +89,9 @@ At the end of every session:
 ## Conventions and gotchas
 - Tests use the standard-library `unittest` framework; CUDA IPC coverage skips without CUDA.
 - Run example modules from the repository root so spawned workers can import them.
-- `PluginManager.unload_all_plugins()` is the application-wide cleanup path; use it in
-  `finally` blocks when a manager may own running workers.
-- The `pyproject.toml` metadata is the dependency/version source of truth; some docs are stale.
+- Use `with PluginManager() as manager:` or call `PluginManager.unload_all_plugins()` /
+  `close()` in `finally` blocks to tear down workers, monitoring, and log handlers.
+- The `pyproject.toml` metadata is the dependency/version source of truth.
 
 ## Do not touch
 - Do not hand-edit generated `parallelazy.egg-info/`, `build/`, `dist/`, or `__pycache__/`.
