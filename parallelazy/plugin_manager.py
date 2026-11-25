@@ -41,6 +41,7 @@ class PluginInfo:
     options: Dict[str, Any]
     stop_confirmed: bool = False
     startup_phase: Optional[Synchronized] = None
+    stopped_event: Optional[Any] = None
 
 class PluginManager:
     """
@@ -414,6 +415,8 @@ class PluginManager:
             worker_channel = plugin_rpc.channel.remote_descriptor()  # For worker to manager communication
             initialized = mp.Event()
             initialized.clear()  # Ensure not set
+            stopped_event = mp.Event()
+            stopped_event.clear()
             startup_phase = mp.Value("i", PluginStartupPhase.NOT_STARTED)
             init_error_r, init_error_w = mp.Pipe(duplex=False)
 
@@ -429,6 +432,7 @@ class PluginManager:
                     runtime_settings,
                     startup_phase,
                     init_error_w,
+                    stopped_event,
                 ),
                 name=f"plugin-{plugin_id}"
             )
@@ -441,6 +445,7 @@ class PluginManager:
                 descriptor=descriptor,
                 options=options,
                 startup_phase=startup_phase,
+                stopped_event=stopped_event,
             )
             with self._plugins_lock:
                 self._plugins[plugin_id] = plugin_info
@@ -576,6 +581,21 @@ class PluginManager:
         }
         
     
+    def _wait_for_graceful_stop(self, info: PluginInfo, timeout: float) -> bool:
+        stopped_event = info.stopped_event
+        if stopped_event is None:
+            return False
+        if stopped_event.is_set():
+            return True
+        deadline = time.monotonic() + max(0.0, timeout)
+        while info.process.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if stopped_event.wait(timeout=min(0.05, remaining)):
+                return True
+        return stopped_event.is_set()
+
     def stop_plugin(self, plugin_id: str) -> bool:
         """
         Stop a running plugin.
@@ -592,15 +612,36 @@ class PluginManager:
             return False
         
         try:
+            if info.stop_confirmed:
+                return True
+
+            if info.stopped_event is not None and info.stopped_event.is_set():
+                info.stop_confirmed = True
+                return True
+
             if not info.process.is_alive():
+                info.stop_confirmed = True
                 return True  # Already stopped
 
+            deadline = time.monotonic() + self.timeout_start
             pending = info.rpc.plugin_stop()
             res = pending.wait(timeout=self.timeout_start)
             if not res:
+                if info.stopped_event is not None and info.stopped_event.is_set():
+                    info.stop_confirmed = True
+                    return True
                 self.logger.warning(f"Plugin {plugin_id} failed to stop within {self.timeout_start} seconds")
                 return False
             if res.error:
+                if info.stopped_event is not None:
+                    if info.stopped_event.is_set():
+                        info.stop_confirmed = True
+                        return True
+                    if "RPC endpoint is stopping" in str(res.error):
+                        remaining = max(0.0, deadline - time.monotonic())
+                        if self._wait_for_graceful_stop(info, remaining):
+                            info.stop_confirmed = True
+                            return True
                 self.logger.error(f"Plugin {plugin_id} stop error: {res.error}")
                 return False
             

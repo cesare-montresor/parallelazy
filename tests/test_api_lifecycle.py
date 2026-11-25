@@ -9,6 +9,7 @@ from tests.helpers import (
     CrashInitPlugin,
     EchoPlugin,
     HangInitPlugin,
+    SelfStoppingPlugin,
     SlowStartPlugin,
     is_pid_alive,
     make_manager,
@@ -182,6 +183,56 @@ class ApiLifecycleTests(unittest.TestCase):
                 self.assertFalse(manager.stop_plugin("unknown"))
                 self.assertTrue(manager.unload_plugin("unknown"))
                 self.assertIsNone(manager.plugin_status("unknown"))
+
+    def test_self_stopping_plugin_shuts_down_without_manager_errors(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = make_manager(tmpdir)
+            try:
+                desc = SelfStoppingPlugin.Descriptor("1.0.0", "tests", name="self-stop")
+                self.assertTrue(manager.load_plugin(desc))
+                self.assertTrue(manager.start_plugin("self-stop"))
+                wait_until(lambda: manager.env_get("self-stop.stopped") is True)
+
+                with self.assertNoLogs(manager.logger.name, level="ERROR"):
+                    self.assertTrue(manager.stop_plugin("self-stop"))
+                    manager.stop_all_plugins()
+                    manager.close()
+            finally:
+                manager.close()
+
+    def test_self_stop_racing_with_manager_stop_waits_for_on_stop_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = make_manager(tmpdir)
+            try:
+                desc = SelfStoppingPlugin.Descriptor(
+                    "1.0.0", "tests", name="self-stop-race", options={"stop_delay": 0.35}
+                )
+                self.assertTrue(manager.load_plugin(desc))
+                self.assertTrue(manager.start_plugin("self-stop-race"))
+                wait_until(lambda: manager.env_get("self-stop-race.stopping") is True)
+
+                with self.assertNoLogs(manager.logger.name, level="ERROR"):
+                    self.assertTrue(manager.stop_plugin("self-stop-race"))
+                    self.assertTrue(manager.env_get("self-stop-race.stopped"))
+                    manager.close()
+            finally:
+                manager.close()
+
+    def test_repeated_stop_and_close_logs_no_errors(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = make_manager(tmpdir)
+            try:
+                desc = BlockingMainPlugin.Descriptor("1.0.0", "tests", name="blocker-clean")
+                self.assertTrue(manager.load_plugin(desc))
+                self.assertTrue(manager.start_plugin("blocker-clean"))
+                wait_until(lambda: manager.env_get("blocker-clean.in_main") is True)
+
+                with self.assertNoLogs(manager.logger.name, level="ERROR"):
+                    self.assertTrue(manager.stop_plugin("blocker-clean"))
+                    self.assertTrue(manager.stop_plugin("blocker-clean"))
+                    manager.close()
+            finally:
+                manager.close()
 
 
 if __name__ == "__main__":

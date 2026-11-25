@@ -139,6 +139,7 @@ class PluginWorker:
         runtime_settings: Optional[PluginRuntimeSettings] = None,
         startup_phase: Optional[Synchronized] = None,
         init_error_conn: Any = None,
+        stopped: Optional[Event] = None,
     ) -> None:
         """
         Entry point for plugin subprocess.
@@ -177,6 +178,7 @@ class PluginWorker:
                 runtime_settings=runtime_settings,
                 logging_session=logging_session,
                 startup_phase=startup_phase,
+                stopped=stopped,
             )
             if init_error_conn is not None:
                 try:
@@ -218,6 +220,7 @@ class PluginWorker:
         runtime_settings: Optional[PluginRuntimeSettings] = None,
         logging_session: Optional[LoggingSession] = None,
         startup_phase: Optional[Synchronized] = None,
+        stopped: Optional[Event] = None,
     ):
         """Initialize worker."""
 
@@ -234,6 +237,7 @@ class PluginWorker:
         self.timeout_request = getattr(runtime_settings, "timeout_request", 5.0)
         self._is_running = False
         self._initialized: Event = initialized
+        self._stopped: Optional[Event] = stopped
         self._startup_phase = startup_phase
         self._logging = logging_session
         self._owns_logging = owns_logging
@@ -394,6 +398,8 @@ class PluginWorker:
             self.plugin._is_running = False
             self.plugin.state = PluginState.STOPPED
             self.did_stop.set()
+            if getattr(self, "_stopped", None) is not None:
+                self._stopped.set()
             self._lifecycle.notify_all()
 
         # Let stop handlers send their responses before closing the channel.

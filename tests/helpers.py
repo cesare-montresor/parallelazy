@@ -174,3 +174,21 @@ class CoordinatorPlugin(Plugin):
 
     def main(self) -> None:
         self.wait_for_stop()
+
+
+class SelfStoppingPlugin(Plugin):
+    """Plugin that calls self.stop() from main() with optional on_stop() delay."""
+
+    @classmethod
+    def default_options(cls) -> Dict[str, Any]:
+        return {"stop_delay": 0.0}
+
+    def main(self) -> None:
+        self.stop()
+
+    def on_stop(self) -> None:
+        self.env_set(f"{self.plugin_id}.stopping", True)
+        delay = float(self.options.get("stop_delay", 0.0))
+        if delay > 0:
+            time.sleep(delay)
+        self.env_set(f"{self.plugin_id}.stopped", True)
