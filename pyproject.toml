@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parallelazy"
-version = "0.2.3"
+version = "0.2.4"
 description = "A lightweight multiprocess worker-plugin framework. Topic-based pub/sub, global environment, using process spawn and pipes, PyTorch and CUDA ready."
 readme = "README.md"
 license = "MPL-2.0"
