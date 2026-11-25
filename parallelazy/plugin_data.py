@@ -16,11 +16,11 @@ Message Flows:
 
 No Commands/Responses wrappers, no double indirection. Just Request and Response.
 """
-from typing import Any, Callable, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 import logging
 from concurrent.futures import Future
 from torch import multiprocessing as mp
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from enum import IntEnum
 from multiprocessing.connection import Connection
 
@@ -66,6 +66,37 @@ class _EnvMissing:
 
 
 ENV_MISSING = _EnvMissing()
+
+
+@dataclass
+class ManagerOptions:
+    """
+    Runtime options for `parallelazy.PluginManager` execution.
+
+    Kept intentionally separate from `PipelineConfig` (hyperparameters) so
+    infrastructure/logging settings never pollute experiment configs or
+    change `config.signature()`.
+    """
+
+    work_dir: Optional[str] = None
+    log_dir: str = "logs"
+    log_level: int = logging.INFO
+    display_logs: bool = True
+    write_logs: bool = True
+    timeout_request: float = 5.0
+    timeout_start: float = 10.0
+    timeout_start_debug: float = 30.0
+    timeout_initialize: float = 30.0
+    timeout_debugger_attach: Optional[float] = None
+
+    def to_manager_kwargs(self) -> Dict[str, Any]:
+        """Return kwargs accepted directly by `parallelazy.PluginManager(...)`."""
+        return asdict(self)
+
+    def with_updates(self, **overrides: Any) -> "ManagerOptions":
+        valid = {f.name for f in fields(self)}
+        filtered = {k: v for k, v in overrides.items() if k in valid}
+        return replace(self, **filtered)
 
 
 class QueueDescriptor:
