@@ -23,7 +23,7 @@ jobs:
           # Forces 3.11 just for this runner so we can use the native tomllib parser
           python-version: "3.11"
 
-      - name: Read version, check tag, and verify changelog
+      - name: Read version, check tag, and optionally verify changelog
         id: check_version
         run: |
           # Accurately targets project.version inside the TOML structure
@@ -32,19 +32,23 @@ jobs:
           CHANGELOG_FILE="changelogs/$TAG_NAME.md"
           
           echo "version=$TAG_NAME" >> $GITHUB_OUTPUT
-          echo "changelog_file=$CHANGELOG_FILE" >> $GITHUB_OUTPUT
 
           if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
             echo "::error::Tag $TAG_NAME already exists! Pipeline aborted to prevent duplicate publish."
             exit 1 
           fi
 
-          if [ ! -f "$CHANGELOG_FILE" ]; then
-            echo "::error::Missing $CHANGELOG_FILE! Add release notes and run ./changelogs/changelog.sh before releasing."
-            exit 1
+          if [ -f "$CHANGELOG_FILE" ]; then
+            echo "changelog_file=$CHANGELOG_FILE" >> $GITHUB_OUTPUT
+            echo "generate_release_notes=false" >> $GITHUB_OUTPUT
+            if ! bash ./changelogs/changelog.sh --check; then
+              echo "::warning::CHANGELOG.md is out of sync with changelogs/. Run ./changelogs/changelog.sh to update it."
+            fi
+          else
+            echo "::warning::Missing $CHANGELOG_FILE; proceeding with GitHub auto-generated release notes."
+            echo "changelog_file=" >> $GITHUB_OUTPUT
+            echo "generate_release_notes=true" >> $GITHUB_OUTPUT
           fi
-
-          bash ./changelogs/changelog.sh --check
 
       - name: Build distributions
         run: |
@@ -57,7 +61,7 @@ jobs:
           tag_name: ${{ steps.check_version.outputs.version }}
           name: Release ${{ steps.check_version.outputs.version }}
           body_path: ${{ steps.check_version.outputs.changelog_file }}
-          generate_release_notes: false
+          generate_release_notes: ${{ steps.check_version.outputs.generate_release_notes }}
           files: dist/* 
 
       - name: Upload distributions

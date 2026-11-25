@@ -100,8 +100,8 @@ At the end of every session:
 - The `pyproject.toml` metadata is the dependency/version source of truth.
 - Changelogs: maintain one `changelogs/vX.Y.Z.md` per release (`## vX.Y.Z (YYYY-MM-DD)` with
   `### Added`/`Changed`/`Fixed` sections) and regenerate root `CHANGELOG.md` via
-  `./changelogs/changelog.sh`. `.github/workflows/publish.yml` requires `changelogs/v<version>.md`
-  to exist and `CHANGELOG.md` to match before publishing.
+  `./changelogs/changelog.sh`. `.github/workflows/publish.yml` uses `changelogs/v<version>.md`
+  when present and warns (falling back to auto-generated release notes) if missing or out of sync.
 
 ## Do not touch
 - Do not hand-edit generated `CHANGELOG.md`, `parallelazy.egg-info/`, `build/`, `dist/`, or `__pycache__/`.
