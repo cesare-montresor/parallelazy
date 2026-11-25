@@ -264,4 +264,4 @@ python -m build
 
 ## License
 
-Distributed under the **GNU General Public License v2.0** — see [LICENSE](https://github.com/cesare-montresor/parallelazy/blob/main/LICENSE) for details. Created by [Cesare Montresor](https://github.com/cesare-montresor).
+Distributed under the **Mozilla Public License, v. 2.0** — see [LICENSE](https://github.com/cesare-montresor/parallelazy/blob/main/LICENSE) for details. Created by [Cesare Montresor](https://github.com/cesare-montresor).
