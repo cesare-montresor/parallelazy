@@ -4,10 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parallelazy"
-version = "0.2.2"
+version = "0.2.3"
 description = "A lightweight multiprocess worker-plugin framework. Topic-based pub/sub, global environment, using process spawn and pipes, PyTorch and CUDA ready."
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MPL-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [
     { name = "Cesare Montresor" }
@@ -40,7 +41,6 @@ include = ["parallelazy*"]
 
 [tool.setuptools.package-data]
 parallelazy = ["SKILL.md"]
-
 
 [project.urls]
 Homepage = "https://github.com/cesare-montresor/parallelazy"

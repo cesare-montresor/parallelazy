@@ -14,6 +14,14 @@ Main Components:
 - ManagerProxy: Client-side proxy for direct manager access from plugins
 """
 
+
+from importlib.metadata import PackageNotFoundError, version as _package_version
+
+try:
+    __version__ = _package_version("parallelazy")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
+
 from parallelazy.environment_manager import EnvironmentManager
 from parallelazy.plugin import Plugin, PluginDescriptor, PluginState
 from parallelazy.plugin_data import (
@@ -84,6 +92,7 @@ from parallelazy.__main__ import (
 from parallelazy.plugin_worker import PluginWorker
 
 __all__ = [
+    "__version__",
     "EnvironmentManager",
     "Plugin",
     "PluginDescriptor",
