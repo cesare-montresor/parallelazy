@@ -1,0 +1,58 @@
+name: Sync PyPI with Releases
+
+on:
+  workflow_dispatch:
+
+jobs:
+  plan-pypi-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    outputs:
+      has_missing: ${{ steps.find_missing.outputs.has_missing }}
+      releases: ${{ steps.find_missing.outputs.releases }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find missing PyPI releases
+        id: find_missing
+        uses: ./.github/actions/find-missing-pypi-releases
+        with:
+          github-token: ${{ github.token }}
+
+  sync-pypi:
+    needs: plan-pypi-sync
+    if: needs.plan-pypi-sync.outputs.has_missing == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    environment:
+      name: pypi
+
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        tag: ${{ fromJson(needs.plan-pypi-sync.outputs.releases) }}
+
+    steps:
+      - name: Download release distributions for ${{ matrix.tag }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "${{ matrix.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "*.whl" \
+            --pattern "*.tar.gz" \
+            --dir dist
+          ls -la dist
+
+      - name: Publish ${{ matrix.tag }} to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
