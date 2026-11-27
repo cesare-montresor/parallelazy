@@ -6,7 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import Any, List
+from typing import Any
 
 from parallelazy import Plugin
 from tests.helpers import is_pid_alive, make_manager, wait_until
@@ -33,7 +33,7 @@ class ChaosCallerPlugin(Plugin):
 
 
 class ChaosPubPlugin(Plugin):
-    def publish_many(self, topic: str, count: int, payload_bytes: int) -> List[int]:
+    def publish_many(self, topic: str, count: int, payload_bytes: int) -> list[int]:
         payload = b"z" * payload_bytes
         counts = []
         for _ in range(count):

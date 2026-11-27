@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from importlib import resources
 from pathlib import Path
-import sys
 
 
 def _skill_resource():

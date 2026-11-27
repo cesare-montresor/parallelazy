@@ -1,50 +1,63 @@
 """Read-only pipeline monitoring for PluginManager."""
 
-from dataclasses import dataclass
+import logging
 import os
 import struct
 import sys
 import tempfile
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from parallelazy.plugin_manager import PluginManager
+
+if sys.platform.startswith("linux"):
+    import fcntl
+    import termios as _linux_termios
+    _FIONREAD = getattr(_linux_termios, "FIONREAD", 0x541B)
+else:
+    fcntl = None
+    _FIONREAD = 0x541B
 
 
 @dataclass(frozen=True)
 class CapabilityAvailability:
     capability: str
     available: bool
-    reason: Optional[str] = None
-    package: Optional[str] = None
-    install_command: Optional[str] = None
+    reason: str | None = None
+    package: str | None = None
+    install_command: str | None = None
 
 
 @dataclass(frozen=True)
 class TopicMetric:
     topic: str
-    publisher: Optional[str]
+    publisher: str | None
     subscriber: str
-    pending_bytes: Optional[int]
-    trend: Optional[str]
+    pending_bytes: int | None
+    trend: str | None
     probe_available: bool
-    probe_reason: Optional[str] = None
+    probe_reason: str | None = None
 
 
 @dataclass(frozen=True)
 class ProcessMetric:
     plugin_id: str
-    root_pid: Optional[int]
+    root_pid: int | None
     alive: bool
-    worker_state: Optional[str]
+    worker_state: str | None
     descendant_count: int
-    cpu_percent: Optional[float]
-    rss_bytes: Optional[int]
-    gpu_memory_bytes: Optional[int]
-    gpu_utilization_percent: Optional[float]
+    cpu_percent: float | None
+    rss_bytes: int | None
+    gpu_memory_bytes: int | None
+    gpu_utilization_percent: float | None
     process_available: bool
     gpu_available: bool
-    process_reason: Optional[str] = None
-    gpu_reason: Optional[str] = None
+    process_reason: str | None = None
+    gpu_reason: str | None = None
     gpu_dependency_missing: bool = False
 
 
@@ -52,28 +65,28 @@ class ProcessMetric:
 class EnvironmentMetric:
     key: str
     value_type: str
-    writes_per_second: Optional[float]
+    writes_per_second: float | None
     stored_size_bytes: int
     subscribers: int
-    last_write_seconds_ago: Optional[float]
+    last_write_seconds_ago: float | None
 
 
 @dataclass(frozen=True)
 class MonitoringSnapshot:
     sampled_at: float
-    topics: Tuple[TopicMetric, ...]
-    processes: Tuple[ProcessMetric, ...]
-    environment: Tuple[EnvironmentMetric, ...]
-    capabilities: Tuple[CapabilityAvailability, ...]
+    topics: tuple[TopicMetric, ...]
+    processes: tuple[ProcessMetric, ...]
+    environment: tuple[EnvironmentMetric, ...]
+    capabilities: tuple[CapabilityAvailability, ...]
 
 
 class MonitoringAdapter:
     """Read-only, manager-specific view used by PipelineMonitor."""
 
-    def __init__(self, manager):
+    def __init__(self, manager: "PluginManager") -> None:
         self.manager = manager
 
-    def snapshot_state(self) -> Dict[str, Any]:
+    def snapshot_state(self) -> dict[str, Any]:
         manager = self.manager
         with manager._plugins_lock:
             publishers = dict(manager._topic_publishers)
@@ -115,9 +128,9 @@ class PipelineMonitor:
         self,
         adapter: MonitoringAdapter,
         sample_interval: float = 1.0,
-        logger=None,
-        report_file: Optional[Union[str, os.PathLike]] = None,
-    ):
+        logger: logging.Logger | None = None,
+        report_file: str | os.PathLike | None = None,
+    ) -> None:
         if isinstance(sample_interval, bool) or not isinstance(sample_interval, (int, float)):
             raise TypeError("sample_interval must be a number")
         if sample_interval <= 0:
@@ -127,22 +140,22 @@ class PipelineMonitor:
         self.sample_interval = float(sample_interval)
         self.logger = logger
         self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._snapshot_lock = threading.Lock()
-        self._snapshot: Optional[MonitoringSnapshot] = None
-        self._previous_topic_bytes: Dict[Tuple[str, str], int] = {}
-        self._previous_environment_counts: Dict[str, int] = {}
-        self._previous_sample_at: Optional[float] = None
-        self._previous_process_cpu: Dict[int, float] = {}
-        self._hotkey_thread: Optional[threading.Thread] = None
-        self._hotkey_stop: Optional[threading.Event] = None
-        self._terminal_settings = None
+        self._snapshot: MonitoringSnapshot | None = None
+        self._previous_topic_bytes: dict[tuple[str, str], int] = {}
+        self._previous_environment_counts: dict[str, int] = {}
+        self._previous_sample_at: float | None = None
+        self._previous_process_cpu: dict[int, float] = {}
+        self._hotkey_thread: threading.Thread | None = None
+        self._hotkey_stop: threading.Event | None = None
+        self._terminal_settings: Any = None
         self._report_file_lock = threading.Lock()
-        self._report_file: Optional[str] = None
+        self._report_file: str | None = None
         if report_file is not None:
             self._report_file = self._normalize_report_file(report_file)
 
-        self._psutil = None
+        self._psutil: Any = None
         self._psutil_status = CapabilityAvailability(
             "process metrics",
             False,
@@ -150,7 +163,7 @@ class PipelineMonitor:
             "psutil",
             "pip install psutil",
         )
-        self._pynvml = None
+        self._pynvml: Any = None
         self._gpu_status = CapabilityAvailability(
             "GPU metrics",
             False,
@@ -160,7 +173,7 @@ class PipelineMonitor:
         )
 
         try:
-            import psutil
+            import psutil  # type: ignore[import-untyped]  # pyright: ignore[reportMissingModuleSource]
 
             self._psutil = psutil
             self._psutil_status = CapabilityAvailability(
@@ -188,6 +201,12 @@ class PipelineMonitor:
         self._thread = None
         self.stop_hotkey()
         self.stop_report_file()
+        if self._pynvml is not None:
+            try:
+                self._pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            self._pynvml = None
 
     def _sampling_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -256,9 +275,9 @@ class PipelineMonitor:
 
     def _sample_topics(
         self,
-        state: Dict[str, Any],
-        elapsed: Optional[float],
-    ) -> List[TopicMetric]:
+        state: dict[str, Any],
+        elapsed: float | None,
+    ) -> list[TopicMetric]:
         del elapsed
         metrics = []
         publishers = state["publishers"]
@@ -282,6 +301,7 @@ class PipelineMonitor:
                     )
             return metrics
 
+        next_topic_bytes: dict[tuple[str, str], int] = {}
         for topic, topic_subscribers in subscribers.items():
             publisher = publishers.get(topic)
             for subscriber_id, subscriber in topic_subscribers.items():
@@ -297,7 +317,7 @@ class PipelineMonitor:
                             trend = "shrinking"
                         else:
                             trend = "steady"
-                    self._previous_topic_bytes[key] = pending
+                    next_topic_bytes[key] = pending
 
                 metrics.append(
                     TopicMetric(
@@ -310,22 +330,24 @@ class PipelineMonitor:
                         None if pending is not None else "Subscriber pipe is unavailable or closed.",
                     )
                 )
+        self._previous_topic_bytes = next_topic_bytes
         return metrics
 
-    def _read_pipe_pending_bytes(self, subscriber: Any) -> Optional[int]:
+    def _read_pipe_pending_bytes(self, subscriber: Any) -> int | None:
+        if fcntl is None:
+            return None
         try:
-            import fcntl
             descriptor = subscriber.queue_descriptor
             connection = descriptor.send if descriptor.send is not None else descriptor.receive
             if connection is None or connection.closed:
                 return None
             pending = struct.pack("I", 0)
-            result = fcntl.ioctl(connection.fileno(), 0x541B, pending, True)
+            result = fcntl.ioctl(connection.fileno(), _FIONREAD, pending, True)
             return struct.unpack("I", result)[0]
         except Exception:
             return None
 
-    def _sample_processes(self, state: Dict[str, Any]) -> List[ProcessMetric]:
+    def _sample_processes(self, state: dict[str, Any]) -> list[ProcessMetric]:
         metrics = []
         current_cpu = {}
         now = time.monotonic()
@@ -335,8 +357,10 @@ class PipelineMonitor:
             else max(0.0, now - self._previous_sample_at)
         )
 
+        plugin_rows = []
+        all_discovered_pids = set()
         for plugin_id, plugin in state["plugins"].items():
-            discovered_pids = set()
+            discovered_pids: set[int] = set()
             root_pid = plugin["pid"]
             alive = plugin["alive"]
             descendant_count = 0
@@ -352,10 +376,12 @@ class PipelineMonitor:
                         unique[process.pid] = process
                     processes = list(unique.values())
                     discovered_pids.update(unique.keys())
+                    all_discovered_pids.update(discovered_pids)
                     descendant_count = max(0, len(processes) - 1)
 
                     rss_bytes = 0
                     total_delta = 0.0
+                    saw_previous = False
                     for process in processes:
                         try:
                             rss_bytes += process.memory_info().rss
@@ -364,15 +390,35 @@ class PipelineMonitor:
                             current_cpu[process.pid] = cumulative
                             previous = self._previous_process_cpu.get(process.pid)
                             if previous is not None and interval:
+                                saw_previous = True
                                 total_delta += max(0.0, cumulative - previous)
                         except (self._psutil.NoSuchProcess, self._psutil.AccessDenied, AttributeError):
                             continue
-                    if interval and total_delta > 0:
+                    if interval and saw_previous:
                         cpu_percent = 100.0 * total_delta / interval
                 except (self._psutil.NoSuchProcess, self._psutil.AccessDenied):
                     descendant_count = 0
 
-            gpu_memory, gpu_utilization = self._sample_gpu(discovered_pids)
+            plugin_rows.append(
+                (plugin_id, root_pid, alive, descendant_count, cpu_percent, rss_bytes, discovered_pids)
+            )
+
+        gpu_memory_by_pid = (
+            self._snapshot_gpu_memory_by_pid() if all_discovered_pids else None
+        )
+
+        for plugin_id, root_pid, alive, descendant_count, cpu_percent, rss_bytes, discovered_pids in plugin_rows:
+            gpu_memory = None
+            gpu_utilization = None
+            if gpu_memory_by_pid is not None and discovered_pids:
+                matched = [
+                    gpu_memory_by_pid[pid]
+                    for pid in discovered_pids
+                    if pid in gpu_memory_by_pid
+                ]
+                if matched:
+                    gpu_memory = sum(matched)
+
             metrics.append(
                 ProcessMetric(
                     plugin_id=plugin_id,
@@ -399,7 +445,7 @@ class PipelineMonitor:
         if self._pynvml is not None:
             return True
         try:
-            import pynvml
+            import pynvml  # type: ignore[import-untyped]
 
         except ImportError:
             self._gpu_status = CapabilityAvailability(
@@ -416,7 +462,7 @@ class PipelineMonitor:
             self._gpu_status = CapabilityAvailability(
                 "GPU metrics",
                 False,
-                "NVML could not initialize: %s" % exc,
+                f"NVML could not initialize: {exc}",
             )
             return False
 
@@ -424,18 +470,15 @@ class PipelineMonitor:
         self._gpu_status = CapabilityAvailability("GPU metrics", True)
         return True
 
-    def _sample_gpu(
-        self,
-        pids: Iterable[int],
-    ) -> Tuple[Optional[int], Optional[float]]:
-        if not pids or not self._initialize_nvml():
-            return None, None
+    def _snapshot_gpu_memory_by_pid(self) -> dict[int, int] | None:
+        if not self._initialize_nvml():
+            return None
 
         pynvml = self._pynvml
+        if pynvml is None:
+            return None
         try:
-            pid_set = set(pids)
-            gpu_memory = 0
-            found_memory = False
+            gpu_memory_by_pid: dict[int, int] = {}
             for index in range(pynvml.nvmlDeviceGetCount()):
                 handle = pynvml.nvmlDeviceGetHandleByIndex(index)
                 try:
@@ -450,27 +493,43 @@ class PipelineMonitor:
                 for process in list(processes) + list(graphics):
                     pid = getattr(process, "pid", None)
                     used = getattr(process, "usedGpuMemory", None)
-                    if pid in pid_set and isinstance(used, int) and used >= 0:
-                        found_memory = True
-                        gpu_memory += used
+                    if isinstance(pid, int) and isinstance(used, int) and used >= 0:
+                        gpu_memory_by_pid[pid] = gpu_memory_by_pid.get(pid, 0) + used
 
-            if found_memory:
-                return gpu_memory, None
-            return None, None
+            return gpu_memory_by_pid
         except Exception as exc:
             self._gpu_status = CapabilityAvailability(
                 "GPU metrics",
                 False,
-                "NVML could not collect GPU metrics: %s" % exc,
+                f"NVML could not collect GPU metrics: {exc}",
             )
+            return None
+
+    def _sample_gpu(
+        self,
+        pids: Iterable[int],
+    ) -> tuple[int | None, float | None]:
+        pid_set = set(pids)
+        if not pid_set:
             return None, None
+        gpu_memory_by_pid = self._snapshot_gpu_memory_by_pid()
+        if gpu_memory_by_pid is None:
+            return None, None
+        matched = [
+            gpu_memory_by_pid[pid]
+            for pid in pid_set
+            if pid in gpu_memory_by_pid
+        ]
+        if matched:
+            return sum(matched), None
+        return None, None
 
     def _sample_environment(
         self,
-        state: Dict[str, Any],
+        state: dict[str, Any],
         wall_now: float,
-        elapsed: Optional[float],
-    ) -> List[EnvironmentMetric]:
+        elapsed: float | None,
+    ) -> list[EnvironmentMetric]:
         metrics = []
         for key, metadata in state["environment"].items():
             count = int(metadata["write_count"])
@@ -501,7 +560,7 @@ class PipelineMonitor:
         del wall_now
         return metrics
 
-    def format_report(self, snapshot: Optional[MonitoringSnapshot] = None) -> str:
+    def format_report(self, snapshot: MonitoringSnapshot | None = None) -> str:
         snapshot = snapshot or self.get_snapshot()
         updated_at = time.strftime(
             "%Y-%m-%d %H:%M:%S",
@@ -516,7 +575,7 @@ class PipelineMonitor:
                 pending = "-"
                 trend = "-"
             else:
-                pending = "%d B" % metric.pending_bytes
+                pending = f"{metric.pending_bytes:d} B"
                 trend = metric.trend or "-"
             topic_rows.append(
                 (
@@ -537,30 +596,30 @@ class PipelineMonitor:
         lines.append("")
 
         process_rows = []
-        for metric in snapshot.processes:
-            if metric.process_available:
-                pid = metric.root_pid if metric.root_pid is not None else "-"
-                descendants = str(metric.descendant_count)
-                cpu = "-" if metric.cpu_percent is None else "%.1f%%" % metric.cpu_percent
-                rss = "-" if metric.rss_bytes is None else self._format_bytes(metric.rss_bytes)
+        for proc_metric in snapshot.processes:
+            if proc_metric.process_available:
+                pid = proc_metric.root_pid if proc_metric.root_pid is not None else "-"
+                descendants = str(proc_metric.descendant_count)
+                cpu = "-" if proc_metric.cpu_percent is None else f"{proc_metric.cpu_percent:.1f}%"
+                rss = "-" if proc_metric.rss_bytes is None else self._format_bytes(proc_metric.rss_bytes)
             else:
                 pid = "unavailable"
                 descendants = "unavailable"
                 cpu = "unavailable"
                 rss = "unavailable"
             gpu_memory = (
-                ("unavailable" if metric.gpu_dependency_missing else "-")
-                if metric.gpu_memory_bytes is None
-                else self._format_bytes(metric.gpu_memory_bytes)
+                ("unavailable" if proc_metric.gpu_dependency_missing else "-")
+                if proc_metric.gpu_memory_bytes is None
+                else self._format_bytes(proc_metric.gpu_memory_bytes)
             )
             gpu_util = (
-                ("unavailable" if metric.gpu_dependency_missing else "-")
-                if metric.gpu_utilization_percent is None
-                else "%.1f%%" % metric.gpu_utilization_percent
+                ("unavailable" if proc_metric.gpu_dependency_missing else "-")
+                if proc_metric.gpu_utilization_percent is None
+                else f"{proc_metric.gpu_utilization_percent:.1f}%"
             )
             process_rows.append(
                 (
-                    metric.plugin_id,
+                    proc_metric.plugin_id,
                     pid,
                     descendants,
                     cpu,
@@ -587,24 +646,24 @@ class PipelineMonitor:
         lines.append("")
 
         environment_rows = []
-        for metric in snapshot.environment:
+        for env_metric in snapshot.environment:
             writes = (
                 "-"
-                if metric.writes_per_second is None
-                else "%.2f/s" % metric.writes_per_second
+                if env_metric.writes_per_second is None
+                else f"{env_metric.writes_per_second:.2f}/s"
             )
             age = (
                 "-"
-                if metric.last_write_seconds_ago is None
-                else "%.1fs ago" % metric.last_write_seconds_ago
+                if env_metric.last_write_seconds_ago is None
+                else f"{env_metric.last_write_seconds_ago:.1f}s ago"
             )
             environment_rows.append(
                 (
-                    metric.key,
-                    metric.value_type,
+                    env_metric.key,
+                    env_metric.value_type,
                     writes,
-                    self._format_bytes(metric.stored_size_bytes),
-                    metric.subscribers,
+                    self._format_bytes(env_metric.stored_size_bytes),
+                    env_metric.subscribers,
                     age,
                 )
             )
@@ -627,20 +686,20 @@ class PipelineMonitor:
             if not capability.available:
                 lines.append("")
                 state = "unavailable" if capability.install_command else "not collected"
-                notice = "%s %s" % (capability.capability, state)
+                notice = f"{capability.capability} {state}"
                 if capability.reason:
-                    notice += ": %s" % capability.reason
+                    notice += f": {capability.reason}"
                 if capability.install_command:
-                    notice += " Enable with: %s" % capability.install_command
+                    notice += f" Enable with: {capability.install_command}"
                 lines.append(notice)
 
         return "\n".join(lines)
 
-    def print_report(self, snapshot: Optional[MonitoringSnapshot] = None) -> None:
+    def print_report(self, snapshot: MonitoringSnapshot | None = None) -> None:
         print(self.format_report(snapshot), flush=True)
 
     @staticmethod
-    def _normalize_report_file(path: Union[str, os.PathLike]) -> str:
+    def _normalize_report_file(path: str | os.PathLike) -> str:
         try:
             normalized = os.fspath(path)
         except TypeError as exc:
@@ -649,7 +708,7 @@ class PipelineMonitor:
             raise ValueError("report_file must be a non-empty path")
         return os.path.abspath(normalized)
 
-    def start_report_file(self, path: Union[str, os.PathLike]) -> str:
+    def start_report_file(self, path: str | os.PathLike) -> str:
         normalized = self._normalize_report_file(path)
         with self._report_file_lock:
             self._report_file = normalized
@@ -661,7 +720,7 @@ class PipelineMonitor:
             self._report_file = None
 
     @property
-    def report_file(self) -> Optional[str]:
+    def report_file(self) -> str | None:
         with self._report_file_lock:
             return self._report_file
 
@@ -707,14 +766,14 @@ class PipelineMonitor:
         title: str,
         headers: Iterable[str],
         rows: Iterable[Iterable[Any]],
-    ) -> List[str]:
+    ) -> list[str]:
         headers = tuple(headers)
-        rows = [tuple(str(value) for value in row) for row in rows]
-        if not rows:
-            rows = [tuple("-" for _ in headers)]
+        row_tuples = [tuple(str(value) for value in row) for row in rows]
+        if not row_tuples:
+            row_tuples = [tuple("-" for _ in headers)]
 
         widths = [
-            max(len(header), *(len(row[index]) for row in rows))
+            max(len(header), *(len(row[index]) for row in row_tuples))
             for index, header in enumerate(headers)
         ]
         separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
@@ -722,7 +781,7 @@ class PipelineMonitor:
         def render_row(values: Iterable[str]) -> str:
             return "| " + " | ".join(
                 value.center(width) if value == "-" else value.ljust(width)
-                for value, width in zip(values, widths)
+                for value, width in zip(values, widths, strict=False)
             ) + " |"
 
         return [
@@ -730,7 +789,7 @@ class PipelineMonitor:
             separator,
             render_row(headers),
             separator,
-            *(render_row(row) for row in rows),
+            *(render_row(row) for row in row_tuples),
             separator,
         ]
 
@@ -741,9 +800,10 @@ class PipelineMonitor:
         for unit in units:
             if amount < 1024.0 or unit == units[-1]:
                 if unit == "B":
-                    return "%d B" % int(amount)
-                return "%.1f %s" % (amount, unit)
+                    return f"{int(amount):d} B"
+                return f"{amount:.1f} {unit}"
             amount /= 1024.0
+        return f"{amount:.1f} {units[-1]}"
 
     def start_hotkey(self, key: str = "m") -> bool:
         if len(key) != 1:
@@ -771,7 +831,7 @@ class PipelineMonitor:
         stop_event = threading.Event()
         self._hotkey_stop = stop_event
 
-        def listen():
+        def listen() -> None:
             import select
 
             while not stop_event.is_set():
@@ -803,14 +863,15 @@ class PipelineMonitor:
     def _start_hotkey_windows(self, key: str) -> bool:
         try:
             import _thread
-            import msvcrt
+            import msvcrt as _msvcrt
         except ImportError:
             return False
 
+        msvcrt: Any = _msvcrt
         stop_event = threading.Event()
         self._hotkey_stop = stop_event
 
-        def listen():
+        def listen() -> None:
             while not stop_event.is_set():
                 try:
                     if not msvcrt.kbhit():

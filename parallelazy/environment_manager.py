@@ -5,10 +5,11 @@ Simple thread-safe system for reading/writing global environment variables
 and broadcasting updates to interested plugins.
 """
 
-from typing import Any, Dict
-from threading import Lock
 import logging
+import sys
 import time
+from threading import Lock
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -17,13 +18,13 @@ logger = logging.getLogger(__name__)
 class EnvironmentManager:
     """Thread-safe manager for shared environment variables."""
     
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize environment manager."""
-        self._env: Dict[str, Any] = {}
+        self._env: dict[str, Any] = {}
         self._lock = Lock()
         self._monitoring_enabled = False
-        self._write_counts: Dict[str, int] = {}
-        self._last_write_times: Dict[str, float] = {}
+        self._write_counts: dict[str, int] = {}
+        self._last_write_times: dict[str, float] = {}
     
     def get(self, key: str, default: Any = None) -> Any:
         """Get environment variable value."""
@@ -52,30 +53,30 @@ class EnvironmentManager:
             self._write_counts = {}
             self._last_write_times = {}
 
-    def monitoring_snapshot(self) -> Dict[str, Dict[str, Any]]:
+    def monitoring_snapshot(self) -> dict[str, dict[str, Any]]:
         """Return environment metadata and write counters without values."""
         with self._lock:
             return {
                 key: {
                     "type": type(value).__name__,
-                    "stored_size": __import__("sys").getsizeof(value),
+                    "stored_size": sys.getsizeof(value),
                     "write_count": self._write_counts.get(key, 0),
                     "last_write": self._last_write_times.get(key),
                 }
                 for key, value in self._env.items()
             }
     
-    def get_all(self) -> Dict[str, Any]:
+    def get_all(self) -> dict[str, Any]:
         """Get all environment variables."""
         with self._lock:
             return self._env.copy()
     
-    def set_all(self, env_dict: Dict[str, Any]) -> None:
+    def set_all(self, env_dict: dict[str, Any]) -> None:
         """Set multiple environment variables."""
         for key, value in env_dict.items():
             self.set(key, value)
     
-    def clear(self, key: str = None) -> None:
+    def clear(self, key: str | None = None) -> None:
         """Clear a specific environment variable, or all variables when key is None."""
         with self._lock:
             if key is None:

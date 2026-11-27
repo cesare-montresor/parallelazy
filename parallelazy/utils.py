@@ -1,10 +1,12 @@
+import logging
 import os
 import re
 import socket
-import logging
-import torch.multiprocessing as mp
-import warnings
 import sys
+import warnings
+from typing import Any
+
+import torch.multiprocessing as mp
 
 logger = logging.getLogger(__name__)
 
@@ -18,16 +20,16 @@ def _notify_vscode_to_attach(port: int, process_name: str) -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(1.0)
             s.connect(('127.0.0.1', ext_port))
-            s.sendall(f"{port}:{process_name}".encode('utf-8'))
+            s.sendall(f"{port}:{process_name}".encode())
     except Exception as e:
         logger.warning(f"Failed to notify VS Code extension on port {ext_port_str}: {e}")
 
-def get_debugpy():
+def get_debugpy() -> Any:
     if "debugpy" in sys.modules:
         return sys.modules["debugpy"]
     else:
         try:
-            import debugpy
+            import debugpy  # type: ignore[import-not-found]
             return debugpy
         except ImportError:
             return None
@@ -38,7 +40,7 @@ def is_debugpy_attached() -> bool:
         return debugpy.is_client_connected()
     return False
 
-def get_debugpy_path():
+def get_debugpy_path() -> str | None:
     debugpy = get_debugpy()
     if debugpy and hasattr(debugpy, "__file__"):
         # Returns the 'libs' folder containing the IDE's debugpy
@@ -88,21 +90,21 @@ def init_debugger(process_name: str = 'worker', wait_for_client: bool = True) ->
     except Exception as e:
         logger.warning(f"Failed to initialize debugger: {e}")
 
-def process_start_spawn(force=False):
+def process_start_spawn(force: bool = False) -> None:
     current = mp.get_start_method(allow_none=True)
     if current == 'spawn':
         return
     if current is None or force:
         mp.set_start_method('spawn', force=force)
     else:
-        warnings.warn(f"Expected spawn start method, got '{current}'. CUDA may be unreliable.")
+        warnings.warn(f"Expected spawn start method, got '{current}'. CUDA may be unreliable.", stacklevel=2)
 
-def camel_to_kebab(text):
+def camel_to_kebab(text: str) -> str:
     s1 = re.sub('(.)([A-Z][a-z]+)', r'\1-\2', text)
     s2 = re.sub('([a-z0-9])([A-Z])', r'\1-\2', s1)
     return s2.lower()
 
-def camel_to_snake(text):
+def camel_to_snake(text: str) -> str:
     s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', text)
     s2 = re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1)
     return s2.lower()

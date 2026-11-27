@@ -2,7 +2,7 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import Any, Dict, List
+from typing import Any
 
 import numpy as np
 import torch
@@ -16,7 +16,7 @@ from tests.helpers import make_manager, wait_until
 class RpcServicePlugin(Plugin):
     def on_start(self) -> None:
         self._lock = threading.Lock()
-        self.error_sources: List[str] = []
+        self.error_sources: list[str] = []
         if self.options.get("fail_start"):
             raise RuntimeError("on_start failure")
 
@@ -31,7 +31,7 @@ class RpcServicePlugin(Plugin):
         with self._lock:
             self.error_sources.append(source or "")
 
-    def compute(self, a: int, b: int, *, scale: float = 1.0) -> Dict[str, Any]:
+    def compute(self, a: int, b: int, *, scale: float = 1.0) -> dict[str, Any]:
         return {
             "sum": (a + b) * scale,
             "arr": np.array([a, b], dtype=np.int32),
@@ -57,11 +57,11 @@ class RpcServicePlugin(Plugin):
             "callback_fired": bool(callback_seen),
         }
 
-    def get_error_sources(self) -> List[str]:
+    def get_error_sources(self) -> list[str]:
         with self._lock:
             return list(self.error_sources)
 
-    def get_peer_errors(self, target: str) -> List[str]:
+    def get_peer_errors(self, target: str) -> list[str]:
         return self.plugin_errors(target)
 
 

@@ -1,7 +1,5 @@
 """Logging setup shared by the manager and isolated plugin workers."""
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import logging
 import os
@@ -9,14 +7,16 @@ import re
 import sys
 import threading
 import time
-from typing import List, Optional, TextIO
-
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, TextIO
 
 DEFAULT_FILE_LOG_FORMAT = "[%(elapsed)s] %(levelname)s %(message)s"
 DEFAULT_CONSOLE_LOG_FORMAT = (
     "%(asctime)s.%(msecs)03dZ %(levelname)s [%(plugin_id)s] %(message)s"
 )
 CONSOLE_DATE_FORMAT = "%H:%M:%S"
+_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,7 @@ class PluginRuntimeSettings:
     timeout_request: float = 5.0
 
 
-def resolve_directory(path: str, base_dir: Optional[str] = None) -> str:
+def resolve_directory(path: str, base_dir: str | None = None) -> str:
     """Return an absolute directory path, resolving relative paths against base_dir."""
     expanded_path = os.path.expanduser(os.fspath(path))
     if not os.path.isabs(expanded_path):
@@ -38,7 +38,7 @@ def resolve_directory(path: str, base_dir: Optional[str] = None) -> str:
 
 
 def create_run_id() -> str:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"{timestamp}_{os.urandom(6).hex()}"
 
 
@@ -84,28 +84,28 @@ class _TeeTextStream:
         self._logger = logger
         self._label = label
         self._mirror_to_terminal = mirror_to_terminal
-        self._buffer = ""
+        self._buffer_parts: list[str] = []
         self._lock = threading.RLock()
         self._logging = threading.local()
 
     @property
-    def encoding(self):
+    def encoding(self) -> str:
         return self._stream.encoding
 
     @property
-    def errors(self):
+    def errors(self) -> str | None:
         return self._stream.errors
 
     @property
-    def buffer(self):
+    def buffer(self) -> Any:
         return self._stream.buffer
 
     @property
-    def name(self):
+    def name(self) -> Any:
         return self._stream.name
 
     @property
-    def closed(self):
+    def closed(self) -> bool:
         return self._stream.closed
 
     def isatty(self) -> bool:
@@ -130,17 +130,20 @@ class _TeeTextStream:
             return written
 
     def _capture_complete_lines(self, text: str) -> None:
-        for index, character in enumerate(text):
-            if character in ("\r", "\n"):
-                if character == "\n" and index > 0 and text[index - 1] == "\r":
-                    continue
-                self._emit_buffer()
-            else:
-                self._buffer += character
+        if "\r" not in text and "\n" not in text:
+            self._buffer_parts.append(text)
+            return
+        parts = _LINE_BREAK_RE.split(text)
+        for chunk in parts[:-1]:
+            if chunk:
+                self._buffer_parts.append(chunk)
+            self._emit_buffer()
+        if parts[-1]:
+            self._buffer_parts.append(parts[-1])
 
     def _emit_buffer(self) -> None:
-        line = self._buffer
-        self._buffer = ""
+        line = "".join(self._buffer_parts)
+        self._buffer_parts.clear()
         self._log_line(line)
 
     def _log_line(self, line: str) -> None:
@@ -158,7 +161,7 @@ class _TeeTextStream:
     def flush(self) -> None:
         with self._lock:
             self._stream.flush()
-            if self._buffer and not getattr(self._logging, "active", False):
+            if self._buffer_parts and not getattr(self._logging, "active", False):
                 self._emit_buffer()
 
     def close(self) -> None:
@@ -229,7 +232,7 @@ class _LogContextFilter(logging.Filter):
 
 
 def _utc_timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 class _RecoveringFileHandler(logging.Handler):
@@ -240,7 +243,8 @@ class _RecoveringFileHandler(logging.Handler):
     def __init__(self, filename: str):
         super().__init__()
         self.base_filename = os.path.abspath(filename)
-        self.stream: Optional[TextIO] = None
+        self.stream: TextIO | None = None
+        self._stream_identity: tuple[int, int] | None = None
         self._open_stream()
 
     def _create_stream(self, filename: str) -> TextIO:
@@ -258,8 +262,17 @@ class _RecoveringFileHandler(logging.Handler):
             raise
         return stream
 
+    @staticmethod
+    def _fd_identity(stream: TextIO) -> tuple[int, int] | None:
+        try:
+            st = os.fstat(stream.fileno())
+            return (st.st_dev, st.st_ino)
+        except OSError:
+            return None
+
     def _open_stream(self) -> None:
         self.stream = self._create_stream(self.base_filename)
+        self._stream_identity = self._fd_identity(self.stream)
 
     def set_filename(self, filename: str) -> None:
         filename = os.path.abspath(filename)
@@ -267,11 +280,13 @@ class _RecoveringFileHandler(logging.Handler):
             return
 
         stream = self._create_stream(filename)
+        identity = self._fd_identity(stream)
         self.acquire()
         try:
             previous_stream = self.stream
             self.base_filename = filename
             self.stream = stream
+            self._stream_identity = identity
             if previous_stream is not None:
                 previous_stream.close()
         finally:
@@ -280,6 +295,7 @@ class _RecoveringFileHandler(logging.Handler):
     def _close_stream(self) -> None:
         stream = self.stream
         self.stream = None
+        self._stream_identity = None
         if stream is not None:
             try:
                 stream.flush()
@@ -296,28 +312,26 @@ class _RecoveringFileHandler(logging.Handler):
             return
 
         try:
-            path_identity = os.stat(self.base_filename)
-            stream_stat = os.fstat(self.stream.fileno())
+            path_stat = os.stat(self.base_filename)
         except FileNotFoundError:
             self._reopen_stream()
             return
 
-        if (path_identity.st_dev, path_identity.st_ino) != (
-            stream_stat.st_dev,
-            stream_stat.st_ino,
-        ):
+        if (path_stat.st_dev, path_stat.st_ino) != self._stream_identity:
             self._reopen_stream()
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             self._ensure_current_stream()
-            self.stream.write(self.format(record) + self.terminator)
-            self.flush()
+            if self.stream is not None:
+                self.stream.write(self.format(record) + self.terminator)
+                self.flush()
         except OSError:
             try:
                 self._reopen_stream()
-                self.stream.write(self.format(record) + self.terminator)
-                self.flush()
+                if self.stream is not None:
+                    self.stream.write(self.format(record) + self.terminator)
+                    self.flush()
             except Exception:
                 self.handleError(record)
         except Exception:
@@ -334,7 +348,7 @@ class _RecoveringFileHandler(logging.Handler):
             super().close()
 
 
-def _make_formatter(format_string: str, datefmt: Optional[str] = None) -> logging.Formatter:
+def _make_formatter(format_string: str, datefmt: str | None = None) -> logging.Formatter:
     formatter = logging.Formatter(format_string, datefmt=datefmt)
     formatter.converter = time.gmtime
 
@@ -373,7 +387,7 @@ class LoggingSession:
         self.file_format = DEFAULT_FILE_LOG_FORMAT
         self.console_format = DEFAULT_CONSOLE_LOG_FORMAT
         self._context_filter = _LogContextFilter(plugin_id, time.monotonic())
-        self._handlers: List[logging.Handler] = []
+        self._handlers: list[logging.Handler] = []
 
         if replace_handlers:
             for handler in list(logger.handlers):
@@ -404,8 +418,8 @@ class LoggingSession:
 
     def set_formats(
         self,
-        file_format: Optional[str] = None,
-        console_format: Optional[str] = None,
+        file_format: str | None = None,
+        console_format: str | None = None,
     ) -> None:
         new_file_format = self.file_format if file_format is None else file_format
         new_console_format = (

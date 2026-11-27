@@ -15,18 +15,25 @@ Main Components:
 """
 
 
-from importlib.metadata import PackageNotFoundError, version as _package_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _package_version
 
 try:
     __version__ = _package_version("parallelazy")
 except PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
+from parallelazy.__main__ import (
+    get_agent_guide,
+    get_agent_guide_path,
+    install_skill,
+)
 from parallelazy.environment_manager import EnvironmentManager
 from parallelazy.plugin import Plugin, PluginDescriptor, PluginState
 from parallelazy.plugin_data import (
     Channel,
     CommandType,
+    ManagerOptions,
     Message,
     PendingRequest,
     PluginStatus,
@@ -60,6 +67,14 @@ from parallelazy.plugin_data import (
     Subscription,
 )
 from parallelazy.plugin_manager import PluginInfo, PluginManager
+from parallelazy.plugin_monitor import (
+    CapabilityAvailability,
+    EnvironmentMetric,
+    MonitoringSnapshot,
+    PipelineMonitor,
+    ProcessMetric,
+    TopicMetric,
+)
 from parallelazy.plugin_rpc import (
     MessageUID,
     PluginCoreRPC,
@@ -74,22 +89,8 @@ from parallelazy.plugin_transport import (
     mark_graph_output,
     sanitize_for_ipc,
 )
-from parallelazy.utils import is_debugpy_attached
-from parallelazy.plugin_monitor import (
-    CapabilityAvailability,
-    EnvironmentMetric,
-    MonitoringSnapshot,
-    PipelineMonitor,
-    ProcessMetric,
-    TopicMetric,
-)
-
-from parallelazy.__main__ import (
-    get_agent_guide,
-    get_agent_guide_path,
-    install_skill,
-)
 from parallelazy.plugin_worker import PluginWorker
+from parallelazy.utils import is_debugpy_attached
 
 __all__ = [
     "__version__",
@@ -99,6 +100,7 @@ __all__ = [
     "PluginState",
     "Channel",
     "CommandType",
+    "ManagerOptions",
     "Message",
     "PendingRequest",
     "PluginStatus",

@@ -5,15 +5,18 @@ Defines the lifecycle, subscription, and service interfaces that all
 plugins must implement or can override.
 """
 
+import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING, Self
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from parallelazy.utils import camel_to_kebab
 
-
 if TYPE_CHECKING:
-    from parallelazy.plugin_worker import PluginWorker 
+    from parallelazy.plugin_data import PendingRequest
+    from parallelazy.plugin_worker import PluginWorker
 
 
 class PluginState(Enum):
@@ -24,17 +27,8 @@ class PluginState(Enum):
     STOPPED = "stopped"
     ERROR = "error"
 
-    def __str__(self): return str(self.value)
-
-"""
-Plugin Descriptor: Serializable metadata for dynamic plugin loading.
-
-Describes a plugin's identity, location, and configuration options.
-"""
-
-from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, Optional
-import json
+    def __str__(self):
+        return str(self.value)
 
 
 @dataclass
@@ -58,15 +52,15 @@ class PluginDescriptor:
     class_name: str
     description: str = ""
     author: str = ""
-    options: Dict[str, Any] = field(default_factory=dict)
+    options: dict[str, Any] = field(default_factory=dict)
     dependencies: list = field(default_factory=list)
-    work_dir: Optional[str] = None
-    log_dir: Optional[str] = None
-    log_level: Optional[int] = None
-    display_logs: Optional[bool] = None
-    write_logs: Optional[bool] = None
+    work_dir: str | None = None
+    log_dir: str | None = None
+    log_level: int | None = None
+    display_logs: bool | None = None
+    write_logs: bool | None = None
     
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert descriptor to dictionary (JSON-serializable)."""
         return asdict(self)
     
@@ -75,7 +69,7 @@ class PluginDescriptor:
         return json.dumps(self.to_dict(), indent=2)
     
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "PluginDescriptor":
+    def from_dict(cls, data: dict[str, Any]) -> "PluginDescriptor":
         """Create descriptor from dictionary."""
         return cls(**data)
     
@@ -114,7 +108,7 @@ class Plugin:
         self.topic_publish("topic", data)
     """
 
-    _registry: dict[str, type[Self]] = {}
+    _registry: dict[str, type["Plugin"]] = {}
         
     def __init_subclass__(cls, plugin_name: str | None = None, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -131,7 +125,7 @@ class Plugin:
 
 
     @classmethod
-    def default_options(cls) -> Dict[str, Any]:
+    def default_options(cls) -> dict[str, Any]:
         return {}
 
     @classmethod
@@ -139,14 +133,14 @@ class Plugin:
         cls,
         version: str,
         author: str,
-        description: str = None,
-        name: str = None,
-        options: Dict[str, Any] = None,
-        work_dir: Optional[str] = None,
-        log_dir: Optional[str] = None,
-        log_level: Optional[int] = None,
-        display_logs: Optional[bool] = None,
-        write_logs: Optional[bool] = None,
+        description: str | None = None,
+        name: str | None = None,
+        options: dict[str, Any] | None = None,
+        work_dir: str | None = None,
+        log_dir: str | None = None,
+        log_level: int | None = None,
+        display_logs: bool | None = None,
+        write_logs: bool | None = None,
     ) -> PluginDescriptor:
         all_options = cls.default_options().copy()
         all_options.update(options or {})
@@ -173,7 +167,7 @@ class Plugin:
             
         )
 
-    def __init__(self, worker: "PluginWorker", plugin_id: str, options: Optional[Dict[str, Any]] = None):
+    def __init__(self, worker: "PluginWorker", plugin_id: str, options: dict[str, Any] | None = None):
         """
         Initialize plugin.
         
@@ -200,8 +194,8 @@ class Plugin:
 
     def set_log_formats(
         self,
-        file_format: Optional[str] = None,
-        console_format: Optional[str] = None,
+        file_format: str | None = None,
+        console_format: str | None = None,
     ) -> None:
         """Change this worker's file and/or console log format."""
         self._worker.set_log_formats(file_format, console_format)
@@ -211,7 +205,7 @@ class Plugin:
         """Run once on the worker's main thread after startup."""
         pass
 
-    def wait_for_stop(self, timeout: Optional[float] = None) -> bool:
+    def wait_for_stop(self, timeout: float | None = None) -> bool:
         """Wait for a stop request, typically from a blocking main() method."""
         return self._worker.wait_for_stop(timeout)
     
@@ -232,7 +226,7 @@ class Plugin:
         """
         pass
     
-    def on_error(self, error: Exception, source: str=None) -> None:
+    def on_error(self, error: Exception, source: str | None = None) -> None:
         """ Called when an error occurs in the plugin."""
         pass
     
@@ -257,15 +251,24 @@ class Plugin:
         """Publish data to a topic. Returns the number of subscribers that received the message."""
         return self._worker.topic_publish(topic, data)
 
-    def topic_list(self, plugin_id: Optional[str] = None) -> List[str]:
+    def topic_list(self, plugin_id: str | None = None) -> list[str]:
         """List available topics, or topics published by a specific plugin."""
         return self._worker.topic_list(plugin_id=plugin_id)
 
-    def env_set(self, name: str, value: Any, wait: bool = True) -> bool:
+    @overload
+    def env_set(self, name: str, value: Any, wait: Literal[True] = True) -> bool: ...
+
+    @overload
+    def env_set(self, name: str, value: Any, wait: Literal[False]) -> "PendingRequest": ...
+
+    @overload
+    def env_set(self, name: str, value: Any, wait: bool = True) -> "PendingRequest | bool": ...
+
+    def env_set(self, name: str, value: Any, wait: bool = True) -> "PendingRequest | bool":
         """Set an environment variable."""
         return self._worker.env_set(name, value, wait=wait)
 
-    def env_get(self, name: str = None, default: Any = None) -> dict | Any:
+    def env_get(self, name: str | None = None, default: Any = None) -> dict[str, Any] | Any:
         """Get an environment variable."""
         if name is None:
             return self._worker.env_get_all()
@@ -284,14 +287,14 @@ class Plugin:
         """Call a method provided by the manager or another plugin."""
         return self._worker.plugin_call(plugin_id, method_name, *args, **kwargs)
 
-    def plugin_errors(self, plugin_id: Optional[str] = None) -> List[str]:
+    def plugin_errors(self, plugin_id: str | None = None) -> list[str]:
         """Get recorded error messages for this plugin or another plugin."""
         return self._worker.plugin_errors(plugin_id)
 
     def plugin_load(
         self,
         descriptor: PluginDescriptor,
-        options: Optional[Dict[str, Any]] = None
+        options: dict[str, Any] | None = None
     ) -> bool:
         """Load a plugin instance from its descriptor."""
         return self._worker.plugin_load(descriptor, options)
@@ -308,10 +311,10 @@ class Plugin:
         """Unload another plugin."""
         return self._worker.plugin_unload(plugin_id)
 
-    def plugin_status(self, plugin_id: str = None) -> Any:
+    def plugin_status(self, plugin_id: str | None = None) -> Any:
         """Get the status of this plugin or another loaded plugin."""
         return self._worker.plugin_status(plugin_id)
 
-    def plugin_status_all(self) -> Dict[str, Any]:
+    def plugin_status_all(self) -> dict[str, Any]:
         """Get the status of all loaded plugins."""
         return self._worker.plugin_status_all()

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parallelazy"
-version = "0.2.6"
+version = "0.2.7"
 description = "A lightweight multiprocess worker-plugin framework. Topic-based pub/sub, global environment, using process spawn and pipes, PyTorch and CUDA ready."
 readme = "README.md"
 license = "MPL-2.0"
@@ -22,6 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
 ]
 
 dependencies = [
@@ -40,9 +41,39 @@ where = ["."]
 include = ["parallelazy*"]
 
 [tool.setuptools.package-data]
-parallelazy = ["SKILL.md"]
+parallelazy = ["SKILL.md", "py.typed"]
 
 [project.urls]
 Homepage = "https://github.com/cesare-montresor/parallelazy"
 Repository = "https://github.com/cesare-montresor/parallelazy"
 Issues = "https://github.com/cesare-montresor/parallelazy/issues"
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "F",    # Pyflakes (logic errors)
+    "E4",   # pycodestyle imports
+    "E7",   # pycodestyle statements
+    "E9",   # pycodestyle runtime/syntax
+    "I",    # isort (deterministic import sorting)
+    "UP",   # pyupgrade (enforces Python 3.11+ syntax)
+    "B",    # flake8-bugbear (catches common bugs and anti-patterns)
+]
+ignore = [
+    "UP038", # isinstance with tuple is faster than union syntax
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+
+[tool.pyright]
+pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
+

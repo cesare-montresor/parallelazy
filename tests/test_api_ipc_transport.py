@@ -1,10 +1,10 @@
-from collections import OrderedDict, defaultdict, namedtuple
-from dataclasses import dataclass
 import tempfile
 import threading
 import time
 import unittest
-from typing import Any, List
+from collections import OrderedDict, defaultdict, namedtuple
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -13,7 +13,6 @@ import torch.nn as nn
 from parallelazy import IpcEventPoolManaged, Plugin, mark_graph_output, sanitize_for_ipc
 from parallelazy.plugin_transport import sanitize_for_ipc_with_info
 from tests.helpers import make_manager, wait_until
-
 
 _Point = namedtuple("_Point", ["x", "y"])
 
@@ -27,7 +26,7 @@ class _TensorBox:
 class CpuTensorRelayPlugin(Plugin):
     def on_start(self) -> None:
         self._lock = threading.Lock()
-        self.received: List[Any] = []
+        self.received: list[Any] = []
         if self.options.get("subscribe_topic"):
             assert self.topic_subscribe(self.options["subscribe_topic"], self._on_msg)
 
@@ -38,7 +37,7 @@ class CpuTensorRelayPlugin(Plugin):
     def echo_tensor(self, t: torch.Tensor, arr: np.ndarray) -> dict:
         return {"t": t * 2, "arr": arr + 1}
 
-    def get_received(self) -> List[Any]:
+    def get_received(self) -> list[Any]:
         with self._lock:
             return list(self.received)
 
@@ -51,7 +50,7 @@ class CudaRelayPlugin(Plugin):
 
     def on_start(self) -> None:
         self._lock = threading.Lock()
-        self.received_sums: List[float] = []
+        self.received_sums: list[float] = []
         topic_in = self.options.get("topic_in")
         if topic_in:
             assert self.topic_subscribe(topic_in, self._on_msg)
@@ -114,7 +113,7 @@ class CudaRelayPlugin(Plugin):
             "not_cleared_before_ack": not_cleared_before_ack,
         }
 
-    def get_received_sums(self) -> List[float]:
+    def get_received_sums(self) -> list[float]:
         with self._lock:
             return list(self.received_sums)
 
@@ -132,9 +131,11 @@ class ApiIpcTransportTests(unittest.TestCase):
         self.assertIs(out_plain, plain)
         self.assertTrue(has_t)
 
-        # Pure Python container reports has_tensor == False
-        _, has_t_none = sanitize_for_ipc_with_info({"a": [1, 2, (3, "x")]})
+        # Pure Python container reports has_tensor == False and returns same object (copy-on-write)
+        plain_payload = {"a": [1, 2, (3, "x")], "s": {4, 5}, "fs": frozenset({6})}
+        out_plain_payload, has_t_none = sanitize_for_ipc_with_info(plain_payload)
         self.assertFalse(has_t_none)
+        self.assertIs(out_plain_payload, plain_payload)
 
         # Container preservation
         pt = sanitize_for_ipc(_Point(marked, "y"))

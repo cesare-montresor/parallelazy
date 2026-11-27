@@ -1,12 +1,12 @@
 import io
 import os
-from pathlib import Path
 import shutil
 import sys
 import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 from parallelazy import Plugin

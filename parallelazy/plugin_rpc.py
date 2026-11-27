@@ -1,16 +1,43 @@
 
 
 import itertools
-import time 
-from typing import Any, Callable, Dict, Optional
 import logging
-from torch import multiprocessing as mp
 import threading
+import time
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.connection import wait
-from parallelazy.plugin_data import Channel, CommandType, Message, PendingRequest, Queue, Request, RequestCallback, RequestEnvGet, RequestEnvGetAll, RequestEnvSet, RequestEnvSubscribe, RequestEnvUnsubscribe, RequestEnvUpdate, RequestPluginCall, RequestPluginErrors, RequestPluginLoad, RequestPluginStart, RequestPluginStatus, RequestPluginStatusAll, RequestPluginStop, RequestPluginUnload, RequestTopicAnnounce, RequestTopicList, RequestTopicSubscribe, RequestTopicUnsubscribe, Response, Subscriber
-from parallelazy.plugin_transport import sanitize_for_ipc
+from typing import Any
 
+from parallelazy.plugin_data import (
+    Channel,
+    CommandType,
+    PendingRequest,
+    Queue,
+    Request,
+    RequestCallback,
+    RequestEnvGet,
+    RequestEnvGetAll,
+    RequestEnvSet,
+    RequestEnvSubscribe,
+    RequestEnvUnsubscribe,
+    RequestEnvUpdate,
+    RequestPluginCall,
+    RequestPluginErrors,
+    RequestPluginLoad,
+    RequestPluginStart,
+    RequestPluginStatus,
+    RequestPluginStatusAll,
+    RequestPluginStop,
+    RequestPluginUnload,
+    RequestTopicAnnounce,
+    RequestTopicList,
+    RequestTopicSubscribe,
+    RequestTopicUnsubscribe,
+    Response,
+    Subscriber,
+)
+from parallelazy.plugin_transport import sanitize_for_ipc
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 class MessageUID:
     """Thread-safe unique ID generator."""
-    def __init__(self, minimal=True):
+    def __init__(self, minimal: bool = True) -> None:
         self._counter = itertools.count()
         self._lock = threading.Lock()
         self.minimal = minimal
@@ -29,11 +56,12 @@ class MessageUID:
             num = next(self._counter)
             self._last = num
         uid = f"{threading.get_ident()}_{num}"
-        if self.minimal: return uid
+        if self.minimal:
+            return uid
         return f"{threading.current_thread().name}_{uid}"
             
     def next(self) -> str: return self.__next__()
-    def current(self) -> str: return self._last
+    def current(self) -> int: return self._last
 
 
 class PluginCoreRPC:
@@ -55,11 +83,11 @@ class PluginCoreRPC:
     def __init__(
         self,
         plugin_id: str,
-        channel: Channel = None,
+        channel: Channel | None = None,
         timeout: float = 5.0,
         start_listener: bool = True,
-        on_disconnect: Optional[Callable[[], None]] = None,
-    ):
+        on_disconnect: Callable[[], None] | None = None,
+    ) -> None:
         """
         Initialize manager proxy.
         
@@ -74,7 +102,7 @@ class PluginCoreRPC:
         self.channel = channel if channel is not None else Channel()
         self.timeout = timeout
         
-        self.command_handlers: Dict[str, RequestCallback] = {}
+        self.command_handlers: dict[str, RequestCallback] = {}
 
         self.uid = MessageUID()
         self._running = True
@@ -83,12 +111,12 @@ class PluginCoreRPC:
         self._shutdown = Queue()
 
         # Request/response routing: cmd_id → PendingRequest
-        self._pending: Dict[str, PendingRequest] = {}
+        self._pending: dict[str, PendingRequest] = {}
         self._pending_lock = threading.Lock()
 
         self._commands_condition = threading.Condition()
         self._accepting_commands = True
-        self._active_commands: Dict[str, int] = {}
+        self._active_commands: dict[str, int] = {}
         
         # Reader thread routes Responses to reply slots
         self._reader = threading.Thread(target=self._channel_listener, daemon=True)
@@ -108,11 +136,11 @@ class PluginCoreRPC:
         if start_listener:
             self.start_listener()
 
-    def start_listener(self):
+    def start_listener(self) -> None:
         if not self._reader.is_alive():
             self._reader.start()
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """Clean up resources."""
         # Step 1: Signal reader to stop
         self._running = False
@@ -144,8 +172,9 @@ class PluginCoreRPC:
         )
         
         self.channel.shutdown()
+        self._shutdown.close()
 
-    def signal_shutdown(self):
+    def signal_shutdown(self) -> None:
         """Wake the reader thread without polling."""
         try:
             self._shutdown.put(None)
@@ -157,7 +186,7 @@ class PluginCoreRPC:
         with self._commands_condition:
             self._accepting_commands = False
 
-    def wait_for_commands(self, exclude=()) -> None:
+    def wait_for_commands(self, exclude: Iterable[str] = ()) -> None:
         """Wait for accepted command handlers to finish, except excluded commands."""
         excluded = {str(command) for command in exclude}
         with self._commands_condition:
@@ -188,12 +217,12 @@ class PluginCoreRPC:
         for pending in pending_items:
             pending.set_error(error)
 
-    def _failed_request(self, error: Any, message_id: Optional[str] = None) -> PendingRequest:
+    def _failed_request(self, error: Any, message_id: str | None = None) -> PendingRequest:
         pending = PendingRequest(message_id or self.uid.next())
         pending.set_error(error)
         return pending
 
-    def forward(self, req: Request, wait: bool = True, timeout: Optional[float] = None) -> Any:
+    def forward(self, req: Request, wait: bool = True, timeout: float | None = None) -> Any:
         forward_req = req.copy()
         
         # Forward the call to the target plugin and wait for response
@@ -245,18 +274,15 @@ class PluginCoreRPC:
             return pending_request
         return pending_request
     
-    def respond(self, req: Request, result: Any = None, error: str = None) -> PendingRequest:
+    def respond(self, req: Request, result: Any = None, error: Any = None) -> None:
         """
         send a response
         """
-        result = sanitize_for_ipc(result)
-        error = sanitize_for_ipc(error)
-
-
         if not self._running:
             logger.debug(f"Plugin {self.plugin_id} RPC is shutting down, response discarded")
             return None
-            
+
+        result = sanitize_for_ipc(result)
         error = str(error) if error else None
 
         resp = Response(result=result, error=error)
@@ -284,8 +310,11 @@ class PluginCoreRPC:
         """
         while self._running:
             try:
-                ready = wait([self.channel._receive._conn, self._shutdown.receiver._conn])
-                if self._shutdown.receiver._conn in ready:
+                shutdown_recv = self._shutdown.receiver
+                if shutdown_recv is None:
+                    break
+                ready = wait([self.channel._receive._conn, shutdown_recv._conn])
+                if shutdown_recv._conn in ready:
                     self._shutdown.get()
                     logger.debug(f"Plugin {self.plugin_id} received shutdown sentinel on channel")
                     break
@@ -366,6 +395,9 @@ class PluginCoreRPC:
     
     def _handle_response(self, resp: Response) -> bool:
         """Route incoming response to pending request."""
+        if resp.message_id is None:
+            logger.warning(f"Received response with no message_id {vars(resp)}")
+            return False
         with self._pending_lock:
             pending_request = self._pending.pop(resp.message_id, None)
         
@@ -396,17 +428,20 @@ class PluginCoreRPC:
             try:
                 result = handler(self, req)
             except Exception as e:
-                import traceback
-                stacktrace = traceback.format_exc()
                 error = str(e)
-                logger.error(f"Error occurred while executing command '{cmd}': {e}\n{stacktrace}", exc_info=True)
+                logger.error(
+                    "Error occurred while executing command '%s': %s",
+                    cmd,
+                    e,
+                    exc_info=True,
+                )
 
             self.respond(req, result=result, error=error)
         finally:
             self._command_finished(cmd)
         
     
-    def on_request(self, command_name: CommandType, func: RequestCallback) -> None:
+    def on_request(self, command_name: str, func: RequestCallback) -> None:
         """
         Register a command handler for an incoming message
         
@@ -429,7 +464,7 @@ class PluginLifeCycleRPC(PluginCoreRPC):
     PLUGIN_ERRORS = "plugin_errors"
     PLUGIN_CALL = "plugin_call"
     """
-    def plugin_load(self, descriptor: Any, options: Dict[str, Any] = None) -> PendingRequest:
+    def plugin_load(self, descriptor: Any, options: dict[str, Any] | None = None) -> PendingRequest:
         """Ask the manager to load an instance described by descriptor."""
         try:
             return self.request(RequestPluginLoad(descriptor=descriptor, options=options))
@@ -437,7 +472,7 @@ class PluginLifeCycleRPC(PluginCoreRPC):
             logger.error(f"Failed to load plugin '{descriptor}': {e}")
             return self._failed_request(e)
 
-    def plugin_start(self, plugin_id: str = None) -> PendingRequest:
+    def plugin_start(self, plugin_id: str | None = None) -> PendingRequest:
         """
         Start a plugin. A manager omits plugin_id when starting its worker.
         """
@@ -448,7 +483,7 @@ class PluginLifeCycleRPC(PluginCoreRPC):
             return self._failed_request(e)
     
 
-    def plugin_stop(self, plugin_id: str = None) -> PendingRequest:
+    def plugin_stop(self, plugin_id: str | None = None) -> PendingRequest:
         """
         Stop a plugin. A manager omits plugin_id when stopping its worker.
         """
@@ -490,7 +525,7 @@ class PluginLifeCycleRPC(PluginCoreRPC):
     # STATUS: Query manager state
     # ========================================================================
     
-    def plugin_status(self, plugin_id: str=None) -> PendingRequest:
+    def plugin_status(self, plugin_id: str | None = None) -> PendingRequest:
         """
         Get status of another plugin.
         
@@ -522,7 +557,7 @@ class PluginLifeCycleRPC(PluginCoreRPC):
             return self._failed_request(e)
 
     
-    def plugin_errors(self, plugin_id:str = None) -> PendingRequest:
+    def plugin_errors(self, plugin_id: str | None = None) -> PendingRequest:
         """
         Get any errors from the manager or other plugins.
         
@@ -664,7 +699,7 @@ class PluginTopicRPC(PluginCoreRPC):
             logger.error(f"Failed to unsubscribe from '{subscriber}': {e}")
             return self._failed_request(e)
 
-    def topic_list(self, plugin_id: str=None) -> PendingRequest:
+    def topic_list(self, plugin_id: str | None = None) -> PendingRequest:
         """
         List all published topics.
         Returns:

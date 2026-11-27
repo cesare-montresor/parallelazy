@@ -1,10 +1,41 @@
 import tempfile
 import threading
 import unittest
-from typing import Any, List
+from typing import Any
 
-from parallelazy import EnvironmentManager, Plugin
+from parallelazy import EnvironmentManager, ManagerOptions, Plugin
 from tests.helpers import make_manager, wait_until
+
+
+class EnvErrorOnInitialPlugin(Plugin):
+    """Raises on the initial env value but should stay subscribed for subsequent updates."""
+
+    def on_start(self) -> None:
+        self._lock = threading.Lock()
+        self.received: list[Any] = []
+        self.error_sources: list[str] = []
+        assert self.env_subscribe("cfg", self._on_cfg)
+
+    def _on_cfg(self, value: Any) -> None:
+        if value == "bad_initial":
+            raise ValueError("initial callback failure")
+        with self._lock:
+            self.received.append(value)
+
+    def on_error(self, error: Exception, source: str = None) -> None:
+        with self._lock:
+            self.error_sources.append(source or "")
+
+    def get_received(self) -> list[Any]:
+        with self._lock:
+            return list(self.received)
+
+    def get_error_sources(self) -> list[str]:
+        with self._lock:
+            return list(self.error_sources)
+
+    def main(self) -> None:
+        self.wait_for_stop()
 
 
 class EnvProbePlugin(Plugin):
@@ -12,7 +43,7 @@ class EnvProbePlugin(Plugin):
 
     def on_start(self) -> None:
         self._lock = threading.Lock()
-        self.received: List[Any] = []
+        self.received: list[Any] = []
         for key in self.options.get("subscribe_keys", []):
             assert self.env_subscribe(key, self._on_update)
 
@@ -20,7 +51,7 @@ class EnvProbePlugin(Plugin):
         with self._lock:
             self.received.append(value)
 
-    def get_received(self) -> List[Any]:
+    def get_received(self) -> list[Any]:
         with self._lock:
             return list(self.received)
 
@@ -129,6 +160,26 @@ class ApiEnvTests(unittest.TestCase):
                 self.assertTrue(manager.unload_plugin("s1"))
                 manager.env_set("k", "v2")
                 wait_until(lambda: manager.plugin_call("s2", "get_received") == [None, "v1", "v2"])
+
+    def test_env_subscribe_initial_callback_error_notifies_and_keeps_subscription(self):
+        opts = ManagerOptions(write_logs=False, display_logs=False)
+        self.assertEqual(opts.to_manager_kwargs()["write_logs"], False)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with make_manager(tmpdir) as manager:
+                manager.env_set("cfg", "bad_initial")
+                desc = EnvErrorOnInitialPlugin.Descriptor("1.0.0", "tests", name="err-sub")
+                self.assertTrue(manager.load_plugin(desc))
+                self.assertTrue(manager.start_plugin("err-sub"))
+
+                self.assertIn("env:cfg", manager.plugin_call("err-sub", "get_error_sources"))
+                self.assertTrue(manager.plugin_errors("err-sub"))
+
+                manager.env_set("cfg", "good_next")
+                wait_until(
+                    lambda: manager.plugin_call("err-sub", "get_received") == ["good_next"],
+                    message="Subscription did not remain active after initial callback error",
+                )
 
 
 if __name__ == "__main__":

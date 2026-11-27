@@ -8,7 +8,11 @@ import unittest
 from unittest.mock import Mock, patch
 
 from parallelazy.plugin import Plugin, PluginDescriptor
-from parallelazy.plugin_logging import LoggingSession, configure_worker_output, plugin_log_filename
+from parallelazy.plugin_logging import (
+    LoggingSession,
+    configure_worker_output,
+    plugin_log_filename,
+)
 from parallelazy.plugin_manager import PluginManager
 from parallelazy.utils import init_debugger
 

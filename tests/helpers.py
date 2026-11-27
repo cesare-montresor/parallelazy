@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import os
-import threading
 import time
-from typing import Any, Callable, Dict, Optional
+from collections.abc import Callable
+from typing import Any
 
 from parallelazy import Plugin, PluginManager
 
@@ -26,7 +26,7 @@ def wait_until(
     raise AssertionError(f"Timed out after {timeout:.2f}s waiting for condition{detail}")
 
 
-def is_pid_alive(pid: Optional[int]) -> bool:
+def is_pid_alive(pid: int | None) -> bool:
     """Return True if pid exists and is not a Linux zombie."""
     if pid is None:
         return False
@@ -67,7 +67,7 @@ class EchoPlugin(Plugin):
     """Lightweight event-driven plugin whose main() returns immediately."""
 
     @classmethod
-    def default_options(cls) -> Dict[str, Any]:
+    def default_options(cls) -> dict[str, Any]:
         return {"a": 1, "b": 2}
 
     def on_start(self) -> None:
@@ -84,7 +84,7 @@ class EchoPlugin(Plugin):
     def echo(self, value: Any, *, prefix: str = "") -> Any:
         return f"{prefix}{value}" if prefix else value
 
-    def get_options(self) -> Dict[str, Any]:
+    def get_options(self) -> dict[str, Any]:
         return dict(self.options)
 
     def get_pid(self) -> int:
@@ -110,7 +110,7 @@ class SlowStartPlugin(Plugin):
     """Plugin that sleeps in on_start() to test stop-during-start ordering."""
 
     @classmethod
-    def default_options(cls) -> Dict[str, Any]:
+    def default_options(cls) -> dict[str, Any]:
         return {"start_delay": 0.35}
 
     def on_start(self) -> None:
@@ -148,7 +148,7 @@ class HangInitPlugin(Plugin):
 class CoordinatorPlugin(Plugin):
     """Plugin that exercises plugin-driven lifecycle RPCs."""
 
-    def manage_child(self, child_name: str) -> Dict[str, Any]:
+    def manage_child(self, child_name: str) -> dict[str, Any]:
         desc = EchoPlugin.Descriptor(version="1.0.0", author="tests", name=child_name)
         loaded = self.plugin_load(desc, options={"b": 99})
         started = self.plugin_start(child_name)
@@ -165,7 +165,7 @@ class CoordinatorPlugin(Plugin):
             "unloaded": unloaded,
         }
 
-    def attempt_self_lifecycle(self) -> Dict[str, bool]:
+    def attempt_self_lifecycle(self) -> dict[str, bool]:
         return {
             "start": self.plugin_start(self.plugin_id),
             "stop": self.plugin_stop(self.plugin_id),
@@ -180,7 +180,7 @@ class SelfStoppingPlugin(Plugin):
     """Plugin that calls self.stop() from main() with optional on_stop() delay."""
 
     @classmethod
-    def default_options(cls) -> Dict[str, Any]:
+    def default_options(cls) -> dict[str, Any]:
         return {"stop_delay": 0.0}
 
     def main(self) -> None:

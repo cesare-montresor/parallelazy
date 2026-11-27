@@ -1,15 +1,16 @@
 import copy
-from collections import OrderedDict, defaultdict
 import dataclasses
-from dataclasses import dataclass
 import gc
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
+from multiprocessing.reduction import ForkingPickler
+from typing import Any
 
 import torch
-from torch import cuda
 import torch.nn as nn
+from torch import cuda
 from torch.multiprocessing.reductions import reduce_tensor
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ def mark_graph_output(t: torch.Tensor) -> torch.Tensor:
     """Call this immediately after a reduce-overhead compiled fn returns.
     PT2 compiled graphs sometimes pool memory in ways that shouldn't cross IPC."""
     if isinstance(t, torch.Tensor):
-        t._from_graph_pool = True
+        t._from_graph_pool = True  # type: ignore[attr-defined]
     return t
 
 
@@ -98,7 +99,7 @@ def _deepcopy_without_hooks(module: nn.Module) -> nn.Module:
                 setattr(m, name, val)
 
 
-def _sanitize_recursive(obj: Any, memo: Dict[int, Any], has_tensor: list[bool]) -> Any:
+def _sanitize_recursive(obj: Any, memo: dict[int, Any], has_tensor: list[bool]) -> Any:
     if obj is None or isinstance(obj, (bool, int, float, str, bytes, bytearray)):
         return obj
 
@@ -114,74 +115,100 @@ def _sanitize_recursive(obj: Any, memo: Dict[int, Any], has_tensor: list[bool]) 
     if obj_id in memo:
         return memo[obj_id]
 
-    if isinstance(obj, OrderedDict):
-        rebuilt = OrderedDict()
-        memo[obj_id] = rebuilt
-        for k, v in obj.items():
-            rebuilt[k] = _sanitize_recursive(v, memo, has_tensor)
-        return rebuilt
-
-    if isinstance(obj, defaultdict):
-        rebuilt = defaultdict(obj.default_factory)
-        memo[obj_id] = rebuilt
-        for k, v in obj.items():
-            rebuilt[k] = _sanitize_recursive(v, memo, has_tensor)
-        return rebuilt
-
     if isinstance(obj, dict):
-        rebuilt = {}
-        memo[obj_id] = rebuilt
+        memo[obj_id] = obj
+        changed = False
+        items = []
         for k, v in obj.items():
-            rebuilt[k] = _sanitize_recursive(v, memo, has_tensor)
-        return rebuilt
+            new_v = _sanitize_recursive(v, memo, has_tensor)
+            if new_v is not v:
+                changed = True
+            items.append((k, new_v))
+        if not changed:
+            return obj
+        rebuilt_dict: dict[Any, Any]
+        if isinstance(obj, OrderedDict):
+            rebuilt_dict = OrderedDict()
+        elif isinstance(obj, defaultdict):
+            rebuilt_dict = defaultdict(obj.default_factory)
+        else:
+            rebuilt_dict = {}
+        memo[obj_id] = rebuilt_dict
+        for k, new_v in items:
+            rebuilt_dict[k] = rebuilt_dict if new_v is obj else new_v
+        return rebuilt_dict
 
     if isinstance(obj, list):
-        rebuilt = []
-        memo[obj_id] = rebuilt
+        memo[obj_id] = obj
+        changed = False
+        items = []
         for item in obj:
-            rebuilt.append(_sanitize_recursive(item, memo, has_tensor))
-        return rebuilt
+            new_item = _sanitize_recursive(item, memo, has_tensor)
+            if new_item is not item:
+                changed = True
+            items.append(new_item)
+        if not changed:
+            return obj
+        rebuilt_list: list[Any] = [None] * len(items)
+        memo[obj_id] = rebuilt_list
+        for idx, new_item in enumerate(items):
+            rebuilt_list[idx] = rebuilt_list if new_item is obj else new_item
+        return rebuilt_list
 
     if isinstance(obj, tuple):
-        if hasattr(obj, "_fields"):
-            # namedtuple
-            cloned = tuple(_sanitize_recursive(v, memo, has_tensor) for v in obj)
-            return type(obj)(*cloned)
-        cloned = [_sanitize_recursive(v, memo, has_tensor) for v in obj]
-        return type(obj)(cloned)
+        memo[obj_id] = obj
+        changed = False
+        items = []
+        for v in obj:
+            new_v = _sanitize_recursive(v, memo, has_tensor)
+            if new_v is not v:
+                changed = True
+            items.append(new_v)
+        if not changed:
+            return obj
+        rebuilt_tuple = type(obj)(*items) if hasattr(obj, "_fields") else type(obj)(items)
+        memo[obj_id] = rebuilt_tuple
+        return rebuilt_tuple
 
-    if isinstance(obj, set):
-        return {_sanitize_recursive(v, memo, has_tensor) for v in obj}
-
-    if isinstance(obj, frozenset):
-        return frozenset(_sanitize_recursive(v, memo, has_tensor) for v in obj)
+    if isinstance(obj, (set, frozenset)):
+        changed = False
+        items = []
+        for v in obj:
+            new_v = _sanitize_recursive(v, memo, has_tensor)
+            if new_v is not v:
+                changed = True
+            items.append(new_v)
+        if not changed:
+            return obj
+        return type(obj)(items)
 
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         memo[obj_id] = obj
-        changed: Dict[str, Any] = {}
+        changed_fields: dict[str, Any] = {}
         for f in dataclasses.fields(obj):
             old_val = getattr(obj, f.name)
             new_val = _sanitize_recursive(old_val, memo, has_tensor)
             if new_val is not old_val:
-                changed[f.name] = new_val
-        if not changed:
+                changed_fields[f.name] = new_val
+        if not changed_fields:
             return obj
+        rebuilt_dc: Any
         try:
             init_changes = {
-                f.name: changed[f.name]
+                f.name: changed_fields[f.name]
                 for f in dataclasses.fields(obj)
-                if f.name in changed and f.init
+                if f.name in changed_fields and f.init
             }
-            rebuilt = dataclasses.replace(obj, **init_changes)
+            rebuilt_dc = dataclasses.replace(obj, **init_changes)
             for f in dataclasses.fields(obj):
-                if f.name in changed and not f.init:
-                    object.__setattr__(rebuilt, f.name, changed[f.name])
+                if f.name in changed_fields and not f.init:
+                    object.__setattr__(rebuilt_dc, f.name, changed_fields[f.name])
         except Exception:
-            rebuilt = copy.copy(obj)
-            for name, val in changed.items():
-                object.__setattr__(rebuilt, name, val)
-        memo[obj_id] = rebuilt
-        return rebuilt
+            rebuilt_dc = copy.copy(obj)
+            for name, val in changed_fields.items():
+                object.__setattr__(rebuilt_dc, name, val)
+        memo[obj_id] = rebuilt_dc
+        return rebuilt_dc
 
     return obj
 
@@ -203,10 +230,54 @@ def sanitize_for_ipc(obj: Any) -> Any:
       - torch.Tensor -> obj.clone() if IPC-received OR compiled-graph output
       - nn.Module    -> deepcopy(obj) (with hooks stripped) if any param/buffer needs cloning
       - dict / OrderedDict / defaultdict / list / tuple / namedtuple / set / frozenset / dataclass
-        -> traversed recursively with cycle detection, preserving container types
+        -> traversed recursively with cycle detection, copy-on-write, preserving container types
       - anything else -> returned unchanged
     """
     return _sanitize_recursive(obj, {}, [False])
+
+
+def _deliver_to_subscribers(
+    topic: str,
+    data: Any,
+    subscribers: list,
+    log: logging.Logger,
+    has_tensor: bool = False,
+) -> tuple[int, list[str]]:
+    """Fan out a payload to subscribers, isolating failures and reporting dead IDs."""
+    payload_bytes = None
+    if len(subscribers) > 1 and not has_tensor:
+        try:
+            payload_bytes = bytes(ForkingPickler.dumps(data))
+        except Exception:
+            payload_bytes = None
+
+    delivered = 0
+    dead_ids: list[str] = []
+    for sub_id, subscriber in subscribers:
+        try:
+            if payload_bytes is not None:
+                subscriber.queue.send_bytes(payload_bytes)
+            else:
+                subscriber.queue.put(data)
+            delivered += 1
+        except (BrokenPipeError, EOFError, OSError, ValueError) as e:
+            log.warning(
+                "Subscriber '%s' on topic '%s' is unavailable (%s); evicting",
+                sub_id,
+                topic,
+                e,
+            )
+            dead_ids.append(sub_id)
+            subscriber.close()
+        except Exception as e:
+            log.error(
+                "Failed to publish to subscriber '%s' on topic '%s': %s",
+                sub_id,
+                topic,
+                e,
+                exc_info=True,
+            )
+    return delivered, dead_ids
 
 
 # =====================================================================
@@ -217,7 +288,7 @@ def sanitize_for_ipc(obj: Any) -> Any:
 class IpcEventCuda:
     ready: cuda.Event
     release: cuda.Event
-    _ack_seq: Optional[torch.Tensor] = None
+    _ack_seq: torch.Tensor | None = None
     _seq: int = 0
 
     def record(self) -> None:
@@ -259,7 +330,7 @@ class _IpcEventSlot:
         self.consumed_event = cuda.Event(interprocess=True)
         self.ack_seq = torch.zeros(1, dtype=torch.int64).share_memory_()
         self.expected_seq: int = 0
-        self.produced_at: Optional[float] = None  # time.monotonic() of last use; None = never used
+        self.produced_at: float | None = None  # time.monotonic() of last use; None = never used
 
     def is_free(self) -> bool:
         if self.produced_at is None:
@@ -295,7 +366,7 @@ class IpcEventPoolManaged:
     def __init__(self, size: int = 4, stale_after_s: float = 30.0):
         self.size = size
         self.stale_after_s = stale_after_s
-        self._slots: List[_IpcEventSlot] = [_IpcEventSlot() for _ in range(size)]
+        self._slots: list[_IpcEventSlot] = [_IpcEventSlot() for _ in range(size)]
         self._rr_idx = 0
 
     def acquire(self, stream_id: str = "") -> IpcEventCuda:

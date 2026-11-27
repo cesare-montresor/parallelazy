@@ -2,12 +2,12 @@ import io
 import os
 import sys
 import tempfile
-import time
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import Mock, patch
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from parallelazy.environment_manager import EnvironmentManager
 from parallelazy.plugin_data import QueueDescriptor
@@ -188,7 +188,8 @@ class PluginMonitoringTests(unittest.TestCase):
 
         monitor = manager.enable_monitoring(sample_interval=0.01)
         self.assertIs(monitor, manager._monitor)
-        self.assertIs(monitor, manager.enable_monitoring(sample_interval=0.01))
+        self.assertIs(monitor, manager.enable_monitoring(sample_interval=0.25))
+        self.assertEqual(monitor.sample_interval, 0.25)
 
         snapshot = manager.get_monitoring_snapshot()
         self.assertIsNotNone(snapshot)
@@ -291,7 +292,7 @@ class PluginMonitoringTests(unittest.TestCase):
                 self.assertEqual(resolved, os.path.abspath(report_path))
                 self.assertTrue(os.path.isfile(report_path))
 
-                with open(report_path, "r", encoding="utf-8") as handle:
+                with open(report_path, encoding="utf-8") as handle:
                     initial = handle.read()
                 self.assertIn("Parallelazy pipeline monitor", initial)
                 self.assertIn("Topics:", initial)
@@ -300,7 +301,7 @@ class PluginMonitoringTests(unittest.TestCase):
                 deadline = time.monotonic() + 2.0
                 latest = initial
                 while time.monotonic() < deadline:
-                    with open(report_path, "r", encoding="utf-8") as handle:
+                    with open(report_path, encoding="utf-8") as handle:
                         latest = handle.read()
                     if "stage" in latest:
                         break
@@ -319,7 +320,7 @@ class PluginMonitoringTests(unittest.TestCase):
                     handle.write("sentinel")
                 manager._monitor.sample()
                 time.sleep(0.05)
-                with open(report_path, "r", encoding="utf-8") as handle:
+                with open(report_path, encoding="utf-8") as handle:
                     self.assertEqual(handle.read(), "sentinel")
             finally:
                 manager.disable_monitoring()
@@ -402,6 +403,76 @@ class PluginMonitoringTests(unittest.TestCase):
 
         # Extended key sequence ("\xe0", "m") was ignored; only the standalone "m" printed
         self.assertEqual(monitor.print_report.call_count, 1)
+
+    def test_nvml_is_queried_once_per_sample_and_shutdown_on_stop(self):
+        manager = _FakeManager()
+        manager._plugins = {
+            "p1": SimpleNamespace(process=_FakeProcess(1001)),
+            "p2": SimpleNamespace(process=_FakeProcess(1002)),
+        }
+
+        class _FakePsutilProc:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def children(self, recursive=True):
+                return []
+
+            def memory_info(self):
+                return SimpleNamespace(rss=1024)
+
+            def cpu_times(self):
+                return SimpleNamespace(user=1.0, system=0.5)
+
+        fake_psutil = SimpleNamespace(
+            Process=_FakePsutilProc,
+            NoSuchProcess=RuntimeError,
+            AccessDenied=PermissionError,
+        )
+        fake_nvml = SimpleNamespace(
+            nvmlInit=Mock(),
+            nvmlShutdown=Mock(),
+            nvmlDeviceGetCount=Mock(return_value=1),
+            nvmlDeviceGetHandleByIndex=Mock(return_value="h0"),
+            nvmlDeviceGetComputeRunningProcesses=Mock(
+                return_value=[
+                    SimpleNamespace(pid=1001, usedGpuMemory=512),
+                    SimpleNamespace(pid=1002, usedGpuMemory=256),
+                ]
+            ),
+            nvmlDeviceGetGraphicsRunningProcesses=Mock(return_value=[]),
+        )
+
+        monitor = PipelineMonitor(MonitoringAdapter(manager))
+        monitor._psutil = fake_psutil
+        monitor._psutil_status = CapabilityAvailability("process metrics", True)
+        monitor._pynvml = fake_nvml
+        monitor._gpu_status = CapabilityAvailability("GPU metrics", True)
+
+        snap1 = monitor.sample()
+        # NVML queried once across both plugins, not once per plugin
+        self.assertEqual(fake_nvml.nvmlDeviceGetCount.call_count, 1)
+        by_id = {m.plugin_id: m for m in snap1.processes}
+        self.assertEqual(by_id["p1"].gpu_memory_bytes, 512)
+        self.assertEqual(by_id["p2"].gpu_memory_bytes, 256)
+
+        # Second sample with unchanged cpu_times reports 0.0% (not None)
+        time.sleep(0.01)
+        snap2 = monitor.sample()
+        by_id2 = {m.plugin_id: m for m in snap2.processes}
+        self.assertEqual(by_id2["p1"].cpu_percent, 0.0)
+        self.assertEqual(by_id2["p2"].cpu_percent, 0.0)
+
+        monitor.stop()
+        fake_nvml.nvmlShutdown.assert_called_once()
+        self.assertIsNone(monitor._pynvml)
+
+    def test_previous_topic_bytes_prunes_removed_subscribers(self):
+        manager = _FakeManager()
+        monitor = PipelineMonitor(MonitoringAdapter(manager))
+        monitor._previous_topic_bytes[("stale", "gone")] = 42
+        monitor.sample()
+        self.assertNotIn(("stale", "gone"), monitor._previous_topic_bytes)
 
 
 if __name__ == "__main__":

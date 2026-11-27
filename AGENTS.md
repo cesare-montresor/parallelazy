@@ -68,11 +68,12 @@ At the end of every session:
   delivers the initial value before subsequent updates, and `env_get()` distinguishes stored
   `None` from unset keys.
 - Topics are live fan-out through per-subscriber pipe-backed queues with strict pipe
-  ownership (subscriber owns read end; manager/publisher own write end). No durable backlog
-  or replay; register subscribers before publishing if the first message matters.
-- `sanitize_for_ipc()` recursively handles containers (with cycle detection) and clones
-  IPC-received or graph-pooled tensors before re-sharing; `mark_graph_output()` marks
-  compiled-graph outputs.
+  ownership (subscriber owns read end; manager/publisher own write end) and single-publisher
+  ownership per topic. No durable backlog or replay; register subscribers before publishing
+  if the first message matters.
+- `sanitize_for_ipc()` recursively handles containers (copy-on-write with cycle detection)
+  and clones IPC-received or graph-pooled tensors before re-sharing; `mark_graph_output()`
+  marks compiled-graph outputs.
 - Monitoring is optional and read-only; topic backlog is measured as pending pipe bytes on
   the write end (`FIONREAD`), not by reading payloads. Process/GPU metrics depend on optional
   `monitoring` extras (`psutil`, `nvidia-ml-py`).
@@ -85,10 +86,11 @@ At the end of every session:
 
 ## Commands
 - Run example: `.venv/bin/python -m examples.example_quickstart` (verified).
-- Test: `.venv/bin/python -m unittest discover -s tests` (verified; 69 tests passed).
+- Test: `.venv/bin/python -m unittest discover -s tests` (verified; 85 tests passed).
 - Build distributions: `.venv/bin/python -m build` (verified).
 - Rebuild changelog: `./changelogs/changelog.sh` (`--check` verifies `CHANGELOG.md` is in sync).
-- Lint: no lint command/configuration is defined in this repository.
+- Lint: `ruff check parallelazy tests` (configured in `pyproject.toml`).
+- Typecheck: `.venv/bin/mypy parallelazy` and `.venv/bin/pyright parallelazy` (PEP 561 `py.typed`, configured in `pyproject.toml`).
 - Debug: select a `Debug Example: ...` configuration in `.vscode/launch.json`.
   Spawned-worker debugging also depends on the companion VS Code extension described in README.
 

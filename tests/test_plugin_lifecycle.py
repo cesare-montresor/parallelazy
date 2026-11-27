@@ -4,8 +4,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from parallelazy.plugin import PluginState
-from parallelazy.plugin_data import Channel, CommandType, PluginStatus, ProcessStatus, RequestPluginStop
-from parallelazy.plugin_data import PluginStartupPhase
+from parallelazy.plugin_data import (
+    Channel,
+    CommandType,
+    PluginStartupPhase,
+    PluginStatus,
+    ProcessStatus,
+    RequestPluginStop,
+)
 from parallelazy.plugin_manager import PluginInfo, PluginManager
 from parallelazy.plugin_rpc import PluginRPC
 from parallelazy.plugin_worker import PluginWorker

@@ -16,15 +16,16 @@ Message Flows:
 
 No Commands/Responses wrappers, no double indirection. Just Request and Response.
 """
-from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 import logging
+import threading
+from collections.abc import Callable
 from concurrent.futures import Future
-from torch import multiprocessing as mp
 from dataclasses import asdict, dataclass, field, fields, replace
 from enum import IntEnum
 from multiprocessing.connection import Connection
+from typing import Any, Self
 
-import threading
+from torch import multiprocessing as mp
 
 
 class PluginStartupPhase(IntEnum):
@@ -39,16 +40,11 @@ class PluginStartupPhase(IntEnum):
 
 
 
-if TYPE_CHECKING:
-    from parallelazy.plugin_rpc import PluginRPC
-    
-
-
 logger = logging.getLogger(__name__)
 
 
-RequestCallback = Callable[["PluginRPC","Request"], Any]
-ResponseCallback = Callable[["PluginRPC","Response"], Any]
+RequestCallback = Callable[[Any, Any], Any]
+ResponseCallback = Callable[[Any, "Response"], Any]
 
 
 
@@ -70,15 +66,9 @@ ENV_MISSING = _EnvMissing()
 
 @dataclass
 class ManagerOptions:
-    """
-    Runtime options for `parallelazy.PluginManager` execution.
+    """Runtime configuration options for `parallelazy.PluginManager`."""
 
-    Kept intentionally separate from `PipelineConfig` (hyperparameters) so
-    infrastructure/logging settings never pollute experiment configs or
-    change `config.signature()`.
-    """
-
-    work_dir: Optional[str] = None
+    work_dir: str | None = None
     log_dir: str = "logs"
     log_level: int = logging.INFO
     display_logs: bool = True
@@ -87,9 +77,9 @@ class ManagerOptions:
     timeout_start: float = 10.0
     timeout_start_debug: float = 30.0
     timeout_initialize: float = 30.0
-    timeout_debugger_attach: Optional[float] = None
+    timeout_debugger_attach: float | None = None
 
-    def to_manager_kwargs(self) -> Dict[str, Any]:
+    def to_manager_kwargs(self) -> dict[str, Any]:
         """Return kwargs accepted directly by `parallelazy.PluginManager(...)`."""
         return asdict(self)
 
@@ -103,10 +93,10 @@ class QueueDescriptor:
     """Descriptor for holding read/write connections representing a pipe-backed queue."""
     def __init__(
         self,
-        send: Optional[Connection] = None,
-        receive: Optional[Connection] = None,
+        send: Connection | None = None,
+        receive: Connection | None = None,
         *,
-        recieve: Optional[Connection] = None,
+        recieve: Connection | None = None,
     ):
         self.send = send
         self.receive = receive if receive is not None else recieve
@@ -123,52 +113,52 @@ class QueueDescriptor:
 # ============================================================================
 class Queue:
     
-    def __init__(self, descriptor: QueueDescriptor = None):
+    def __init__(self, descriptor: QueueDescriptor | None = None) -> None:
         if descriptor is None:
             receive, send = mp.Pipe(duplex=False)
-            self._send = QueueSend(send)
-            self._receive = QueueReceive(receive)
+            self._send: QueueSend | None = QueueSend(send)
+            self._receive: QueueReceive | None = QueueReceive(receive)
         else:
             self._send = QueueSend(descriptor.send) if descriptor.send is not None else None
             self._receive = QueueReceive(descriptor.receive) if descriptor.receive is not None else None
 
     @property
-    def sender(self):
+    def sender(self) -> "QueueSend | None":
         return self._send
     
     @property
-    def receiver(self):
+    def receiver(self) -> "QueueReceive | None":
         return self._receive
     
-    def closed(self):
+    def closed(self) -> bool:
         send_closed = self._send._conn.closed if self._send is not None else True
         recv_closed = self._receive._conn.closed if self._receive is not None else True
         if self._send is not None and self._receive is not None:
             return send_closed or recv_closed
         return send_closed and recv_closed
     
-    def put(self, item):
+    def put(self, item: Any) -> None:
         if self._send is None:
             raise ValueError("Queue has no send end")
         self._send.put(item)
 
-    def put_nowait(self, item):
+    def put_nowait(self, item: Any) -> None:
         self.put(item)
 
-    def send_bytes(self, data: bytes):
+    def send_bytes(self, data: bytes) -> None:
         if self._send is None:
             raise ValueError("Queue has no send end")
         self._send.send_bytes(data)
     
-    def get(self):
+    def get(self) -> Any:
         if self._receive is None:
             raise ValueError("Queue has no receive end")
         return self._receive.get()
     
-    def get_nowait(self):
+    def get_nowait(self) -> Any:
         return self.get()
 
-    def close_sender(self):
+    def close_sender(self) -> None:
         if self._send is not None:
             try:
                 self._send.close()
@@ -176,7 +166,7 @@ class Queue:
                 pass
             self._send = None
 
-    def close(self):
+    def close(self) -> None:
         self.close_sender()
         if self._receive is not None:
             try:
@@ -185,13 +175,13 @@ class Queue:
                 pass
             self._receive = None
 
-    def descriptor(self):
+    def descriptor(self) -> QueueDescriptor:
         return QueueDescriptor(
             send=self._send._conn if self._send is not None else None,
             receive=self._receive._conn if self._receive is not None else None,
         )
 
-    def send_descriptor(self):
+    def send_descriptor(self) -> QueueDescriptor:
         """Return a descriptor containing only the write end of the pipe."""
         return QueueDescriptor(
             send=self._send._conn if self._send is not None else None,
@@ -200,30 +190,30 @@ class Queue:
 
 
 class QueueSend:
-    def __init__(self, conn: Connection):
+    def __init__(self, conn: Connection) -> None:
         self._conn = conn
         self._lock = threading.Lock()
 
-    def put(self, item):
+    def put(self, item: Any) -> None:
         with self._lock:
             self._conn.send(item)
 
-    def send_bytes(self, data: bytes):
+    def send_bytes(self, data: bytes) -> None:
         with self._lock:
             self._conn.send_bytes(data)
 
-    def close(self):
+    def close(self) -> None:
         self._conn.close()
 
 
 class QueueReceive:
-    def __init__(self, conn: Connection):
+    def __init__(self, conn: Connection) -> None:
         self._conn = conn
 
-    def get(self):
+    def get(self) -> Any:
         return self._conn.recv()
 
-    def close(self):
+    def close(self) -> None:
         self._conn.close()
 
 
@@ -236,33 +226,35 @@ class Channel:
     Pass channel.reverse() to the other process — it's picklable.
     """
 
-    def __init__(self, descriptor: QueueDescriptor = None ):
+    def __init__(self, descriptor: QueueDescriptor | None = None) -> None:
         if descriptor is None:
             r1, w1 = mp.Pipe(duplex=False)
             r2, w2 = mp.Pipe(duplex=False)
             self._send = QueueSend(w1)
             self._receive = QueueReceive(r2)
-            self._remote_send = QueueSend(w2)
-            self._remote_receive = QueueReceive(r1)
+            self._remote_send: QueueSend | None = QueueSend(w2)
+            self._remote_receive: QueueReceive | None = QueueReceive(r1)
         else:
+            assert descriptor.send is not None and descriptor.receive is not None
             self._send = QueueSend(descriptor.send)
             self._receive = QueueReceive(descriptor.receive)
             self._remote_send = None
             self._remote_receive = None
 
     
-    def descriptor(self):
+    def descriptor(self) -> QueueDescriptor:
         return QueueDescriptor(self._send._conn, self._receive._conn)
 
 
-    def remote_descriptor(self):
+    def remote_descriptor(self) -> QueueDescriptor:
+        assert self._remote_send is not None and self._remote_receive is not None
         return QueueDescriptor(self._remote_send._conn, self._remote_receive._conn)
     
 
-    def send(self, message) -> None:
+    def send(self, message: Any) -> None:
         self._send.put(message)
 
-    def receive(self) -> Optional[object]:
+    def receive(self) -> object | None:
         """Receive a message, blocking until one arrives or the pipe closes."""
         return self._receive.get()
 
@@ -275,7 +267,7 @@ class Channel:
             self._remote_receive.close()
             self._remote_receive = None
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         if self._send:
             self._send.close()
         if self._receive:
@@ -311,37 +303,39 @@ class CommandType:
     TOPIC_ANNOUNCE = "topic_announce"
     TOPIC_LIST = "topic_list"
 
+    _ALL_COMMANDS = frozenset({
+        PLUGIN_LOAD,
+        PLUGIN_START,
+        PLUGIN_STOP,
+        PLUGIN_UNLOAD,
+        PLUGIN_STATUS,
+        PLUGIN_STATUS_ALL,
+        PLUGIN_ERRORS,
+        PLUGIN_CALL,
+        ENV_SET,
+        ENV_GET,
+        ENV_GET_ALL,
+        ENV_SUBSCRIBE,
+        ENV_UNSUBSCRIBE,
+        ENV_UPDATE,
+        TOPIC_SUBSCRIBE,
+        TOPIC_UNSUBSCRIBE,
+        TOPIC_ANNOUNCE,
+        TOPIC_LIST,
+    })
+
     @classmethod
-    def commands(cls):
-        return iter([
-            cls.PLUGIN_LOAD,
-            cls.PLUGIN_START,
-            cls.PLUGIN_STOP,
-            cls.PLUGIN_UNLOAD,
-            cls.PLUGIN_STATUS,
-            cls.PLUGIN_STATUS_ALL,
-            cls.PLUGIN_ERRORS,
-            cls.PLUGIN_CALL,
-            cls.ENV_SET,
-            cls.ENV_GET,
-            cls.ENV_GET_ALL,
-            cls.ENV_SUBSCRIBE,
-            cls.ENV_UNSUBSCRIBE,
-            cls.ENV_UPDATE,
-            cls.TOPIC_SUBSCRIBE,
-            cls.TOPIC_UNSUBSCRIBE,
-            cls.TOPIC_ANNOUNCE,
-            cls.TOPIC_LIST
-        ])
+    def commands(cls) -> frozenset[str]:
+        return cls._ALL_COMMANDS
 
 
 @dataclass
 class Message:
     """Base message class for all communication."""
-    sender: str = None
-    message_id: str = None
+    sender: str | None = None
+    message_id: str | None = None
     
-    def copy(self):
+    def copy(self) -> Self:
         kwargs = {f.name: getattr(self, f.name) for f in fields(self)}
         kwargs['message_id'] = None
         return type(self)(**kwargs)
@@ -352,9 +346,9 @@ class Request(Message):
     Unified request for all operations.ada
     Worker replies with Response(message_id, result=...) or Response(message_id, error=...)
     """
-    command: CommandType = None
+    command: str = ""
 
-    def copy(self):
+    def copy(self) -> Self:
         """Create a copy of the message (for forwarding/modification)."""
         clone = type(self)(**self.__dict__)
         clone.message_id = None  # message_id are generated at request time.
@@ -368,26 +362,26 @@ class Response(Message):
      - error: An error message (if an error occurred)
     """
     result: Any = None
-    error: Optional[str] = None
+    error: str | None = None
 
-class PendingRequest():
+class PendingRequest:
     def __init__(
         self,
         message_id: str,
-        callback: Callable = None,
-        on_timeout: Optional[Callable[[str], None]] = None,
-    ):
+        callback: Callable[..., Any] | None = None,
+        on_timeout: Callable[[str], None] | None = None,
+    ) -> None:
         super().__init__()
-        self.future = Future()
+        self.future: Future[Response] = Future()
         self.message_id = message_id
         self._on_timeout = on_timeout
         if callback:
             self.future.add_done_callback(callback)
 
-    def on_ready(self, callback: Callable):
+    def on_ready(self, callback: Callable[..., Any]) -> None:
         self.future.add_done_callback(callback)
     
-    def set_result(self, result: Response|Any):
+    def set_result(self, result: Response | Any) -> None:
         if not isinstance(result, Response):
             result = Response(message_id=self.message_id, result=result)
         if not self.future.done():
@@ -396,14 +390,14 @@ class PendingRequest():
             except Exception:
                 pass
 
-    def set_error(self, error: str|Exception|Any):
+    def set_error(self, error: str | Exception | Any) -> None:
         if not self.future.done():
             try:
                 self.future.set_result(Response(message_id=self.message_id, error=str(error)))
             except Exception:
                 pass
 
-    def wait(self, timeout=None) -> None | Response:
+    def wait(self, timeout: float | None = None) -> None | Response:
         try:
             result: Response = self.future.result(timeout=timeout)
             return result
@@ -412,7 +406,7 @@ class PendingRequest():
                 self._on_timeout(self.message_id)
             return None
         
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash(self.message_id)
 
 
@@ -420,11 +414,11 @@ class Subscription:
     """
     Represents a subscription to a topic or environment variable.
     """
-    def __init__(self, topic: str, callback: Callable, queue: Queue=None, thread: Optional[threading.Thread] = None):
+    def __init__(self, topic: str, callback: Callable[..., Any], queue: Queue | None = None, thread: threading.Thread | None = None) -> None:
         self.topic = topic
         self.callback = callback
         self.queue = queue or Queue()  # For topic subscriptions, queue to receive data
-        self.thread: Optional[threading.Thread] = thread  # Thread handling this subscription (if needed)
+        self.thread: threading.Thread | None = thread  # Thread handling this subscription (if needed)
         self._wakeup_r, self._wakeup_w = mp.Pipe(duplex=False)
         self._wakeup_lock = threading.Lock()
         self._stopped = False
@@ -457,11 +451,11 @@ class Subscription:
 
 class Subscriber:
     """Represents a subscriber to a topic or environment variable."""
-    def __init__(self, plugin_id: str, topic: str, queue_descriptor: QueueDescriptor, queue: Optional[Queue] = None):
+    def __init__(self, plugin_id: str, topic: str, queue_descriptor: QueueDescriptor, queue: Queue | None = None):
         self.plugin_id: str = plugin_id
         self.topic: str = topic
         self.queue_descriptor: QueueDescriptor = queue_descriptor
-        self._queue: Optional[Queue] = queue  # Will be initialized when subscription is active
+        self._queue: Queue | None = queue  # Will be initialized when subscription is active
     
     @property
     def queue(self) -> Queue:
@@ -470,7 +464,7 @@ class Subscriber:
         return self._queue
     
     @queue.setter
-    def queue(self, value: Queue):
+    def queue(self, value: Queue) -> None:
         self._queue = value
 
     def close(self) -> None:
@@ -507,7 +501,7 @@ class PluginStatus:
     published: int            # Number of topics published
     errors: int
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         return {
             "plugin_id": self.plugin_id,
             "state": self.state,
@@ -524,9 +518,9 @@ class ProcessStatus:
     """Manager-side process state, including the worker's startup phase."""
     plugin_id: str
     process_alive: bool
-    process_pid: Optional[int]
-    worker_status: Optional[PluginStatus] = None
-    startup_phase: Optional[str] = None
+    process_pid: int | None
+    worker_status: PluginStatus | None = None
+    startup_phase: str | None = None
 
 
 
@@ -561,101 +555,101 @@ Classes for each request command:
 
 @dataclass
 class RequestPluginLoad(Request):
-    command: CommandType = field(default=CommandType.PLUGIN_LOAD, init=False)
+    command: str = field(default=CommandType.PLUGIN_LOAD, init=False)
     descriptor: Any = None
-    options: Optional[dict] = None
+    options: dict[str, Any] | None = None
 
 @dataclass
 class RequestPluginStart(Request):
-    command: CommandType = field(default=CommandType.PLUGIN_START, init=False)
-    plugin_id: Optional[str] = None
+    command: str = field(default=CommandType.PLUGIN_START, init=False)
+    plugin_id: str | None = None
 
 @dataclass
 class RequestPluginStop(Request):
-    command: CommandType = field(default=CommandType.PLUGIN_STOP, init=False)
-    plugin_id: Optional[str] = None
+    command: str = field(default=CommandType.PLUGIN_STOP, init=False)
+    plugin_id: str | None = None
 
 @dataclass
 class RequestPluginUnload(Request):
-    command: CommandType = field(default=CommandType.PLUGIN_UNLOAD, init=False)
-    plugin_id: Optional[str] = None
+    command: str = field(default=CommandType.PLUGIN_UNLOAD, init=False)
+    plugin_id: str | None = None
 
 @dataclass
 class RequestPluginStatus(Request):
-    command: CommandType = field(default=CommandType.PLUGIN_STATUS, init=False)
-    plugin_id: Optional[str] = None
+    command: str = field(default=CommandType.PLUGIN_STATUS, init=False)
+    plugin_id: str | None = None
 
 @dataclass
 class RequestPluginStatusAll(Request):
-    command: CommandType = field(default=CommandType.PLUGIN_STATUS_ALL, init=False)
+    command: str = field(default=CommandType.PLUGIN_STATUS_ALL, init=False)
 
 @dataclass
 class RequestPluginErrors(Request):
-    command: CommandType = field(default=CommandType.PLUGIN_ERRORS, init=False)
-    plugin_id: Optional[str] = None
+    command: str = field(default=CommandType.PLUGIN_ERRORS, init=False)
+    plugin_id: str | None = None
 
 @dataclass
 class RequestPluginCall(Request):
-    command: CommandType = field(default=CommandType.PLUGIN_CALL, init=False)
-    plugin_id: str = None
-    method_name: str = None
-    args: tuple = None
-    kwargs: dict = None
+    command: str = field(default=CommandType.PLUGIN_CALL, init=False)
+    plugin_id: str | None = None
+    method_name: str | None = None
+    args: tuple[Any, ...] | None = None
+    kwargs: dict[str, Any] | None = None
 
 @dataclass
 class RequestEnvSet(Request):
-    command: CommandType = field(default=CommandType.ENV_SET, init=False)
-    name: str = None
+    command: str = field(default=CommandType.ENV_SET, init=False)
+    name: str | None = None
     value: Any = None
 
 @dataclass
 class RequestEnvGet(Request):
-    command: CommandType = field(default=CommandType.ENV_GET, init=False)
-    name: str = None
+    command: str = field(default=CommandType.ENV_GET, init=False)
+    name: str | None = None
 
 @dataclass
 class RequestEnvGetAll(Request):    
-    command: CommandType = field(default=CommandType.ENV_GET_ALL, init=False)
+    command: str = field(default=CommandType.ENV_GET_ALL, init=False)
 
 
 @dataclass
 class RequestEnvSubscribe(Request):
-    command: CommandType = field(default=CommandType.ENV_SUBSCRIBE, init=False)
-    name: str = None
+    command: str = field(default=CommandType.ENV_SUBSCRIBE, init=False)
+    name: str | None = None
 
 
 @dataclass
 class RequestEnvUnsubscribe(Request):
-    command: CommandType = field(default=CommandType.ENV_UNSUBSCRIBE, init=False)
-    name: str = None
+    command: str = field(default=CommandType.ENV_UNSUBSCRIBE, init=False)
+    name: str | None = None
 
 @dataclass
 class RequestEnvUpdate(Request):
-    command: CommandType = field(default=CommandType.ENV_UPDATE, init=False)
-    name: str = None
+    command: str = field(default=CommandType.ENV_UPDATE, init=False)
+    name: str | None = None
     value: Any = None
 
 ### Pub/Sub Requests
 
 @dataclass
 class RequestTopicSubscribe(Request):
-    command: CommandType = field(default=CommandType.TOPIC_SUBSCRIBE, init=False)
-    subscriber: Subscriber = None
+    command: str = field(default=CommandType.TOPIC_SUBSCRIBE, init=False)
+    subscriber: Subscriber | None = None
 
 @dataclass
 class RequestTopicUnsubscribe(Request):
-    command: CommandType = field(default=CommandType.TOPIC_UNSUBSCRIBE, init=False)
-    subscriber: Subscriber = None
+    command: str = field(default=CommandType.TOPIC_UNSUBSCRIBE, init=False)
+    subscriber: Subscriber | None = None
 
 
 @dataclass
 class RequestTopicAnnounce(Request):
-    command: CommandType = field(default=CommandType.TOPIC_ANNOUNCE, init=False)
-    topic: str = None
+    command: str = field(default=CommandType.TOPIC_ANNOUNCE, init=False)
+    topic: str | None = None
 
 
 @dataclass
 class RequestTopicList(Request):
-    command: CommandType = field(default=CommandType.TOPIC_LIST, init=False)
-    plugin_id: Optional[str] = None
+    command: str = field(default=CommandType.TOPIC_LIST, init=False)
+    plugin_id: str | None = None
 

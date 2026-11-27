@@ -1,11 +1,11 @@
 import tempfile
 import threading
 import unittest
-from typing import Any, List
+from typing import Any
 
 import torch
 
-from parallelazy import Plugin
+from parallelazy import Plugin, PluginRPC
 from tests.helpers import make_manager, wait_until
 
 
@@ -19,7 +19,7 @@ class PubPlugin(Plugin):
             total += self.topic_publish(topic, i)
         return total
 
-    def list_topics(self, plugin_id: str = None) -> List[str]:
+    def list_topics(self, plugin_id: str = None) -> list[str]:
         return self.topic_list(plugin_id=plugin_id)
 
     def main(self) -> None:
@@ -29,8 +29,8 @@ class PubPlugin(Plugin):
 class SubPlugin(Plugin):
     def on_start(self) -> None:
         self._lock = threading.Lock()
-        self.received: List[Any] = []
-        self.error_sources: List[str] = []
+        self.received: list[Any] = []
+        self.error_sources: list[str] = []
         for topic in self.options.get("topics", []):
             assert self.topic_subscribe(topic, self._on_msg)
 
@@ -50,15 +50,15 @@ class SubPlugin(Plugin):
     def unsubscribe(self, topic: str) -> bool:
         return self.topic_unsubscribe(topic)
 
-    def get_received(self) -> List[Any]:
+    def get_received(self) -> list[Any]:
         with self._lock:
             return list(self.received)
 
-    def get_error_sources(self) -> List[str]:
+    def get_error_sources(self) -> list[str]:
         with self._lock:
             return list(self.error_sources)
 
-    def list_topics(self, plugin_id: str = None) -> List[str]:
+    def list_topics(self, plugin_id: str = None) -> list[str]:
         return self.topic_list(plugin_id=plugin_id)
 
     def main(self) -> None:
@@ -166,6 +166,30 @@ class ApiPubSubTests(unittest.TestCase):
                 self.assertTrue(manager.start_plugin("p2"))
                 self.assertEqual(manager.plugin_call("p2", "publish", "ch", "v3"), 1)
                 wait_until(lambda: manager.plugin_call("s2", "get_received") == ["v1", "v2", "v3"])
+
+    def test_single_publisher_ownership_enforced_and_rpc_shutdown_closes_wakeup_pipe(self):
+        rpc = PluginRPC("fd-check", start_listener=False)
+        rpc.shutdown()
+        self.assertTrue(rpc._shutdown.closed())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with make_manager(tmpdir) as manager:
+                s1 = SubPlugin.Descriptor("1.0.0", "tests", name="s1", options={"topics": ["solo"]})
+                p1 = PubPlugin.Descriptor("1.0.0", "tests", name="p1")
+                p2 = PubPlugin.Descriptor("1.0.0", "tests", name="p2")
+                self.assertEqual(manager.load_plugins([s1, p1, p2]), {"s1": True, "p1": True, "p2": True})
+                self.assertEqual(manager.start_all_plugins(), {"s1": True, "p1": True, "p2": True})
+
+                self.assertEqual(manager.plugin_call("p1", "publish", "solo", "from-p1"), 1)
+                wait_until(lambda: manager.plugin_call("s1", "get_received") == ["from-p1"])
+
+                # Second publisher cannot hijack an active single-publisher topic
+                self.assertEqual(manager.plugin_call("p2", "publish", "solo", "from-p2"), 0)
+                self.assertTrue(manager.plugin_errors("p2"))
+
+                # Original publisher still delivers normally
+                self.assertEqual(manager.plugin_call("p1", "publish", "solo", "still-p1"), 1)
+                wait_until(lambda: manager.plugin_call("s1", "get_received") == ["from-p1", "still-p1"])
 
 
 if __name__ == "__main__":

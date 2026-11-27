@@ -88,13 +88,14 @@ if __name__ == "__main__":
 - Plugin: `self.topic_subscribe(topic, callback) -> bool`, `self.topic_unsubscribe(topic) -> bool`, `self.topic_publish(topic, data) -> int`, `self.topic_list(plugin_id=None) -> list[str]`
 - Manager: `manager.topic_publish(topic, data) -> int`, `manager.topic_list(plugin_id=None) -> list[str]`
 - **No backlog or replay**: messages published before a subscriber registers are dropped. Register subscribers in `on_start()` (and coordinate readiness via `env_set` / `env_subscribe` or start subscribers before publishers) if the first message matters.
+- **Single-publisher ownership**: each topic is owned by one active plugin publisher at a time; a second plugin attempting to publish to an already-owned topic fails until the first unloads.
 - Callbacks take a single argument `(self, payload)`.
 
 ### Shared Environment (Manager-Owned Key/Value Store)
 - Plugin: `self.env_set(name, value, wait=True) -> bool`, `self.env_get(name=None, default=None)`, `self.env_subscribe(name, callback) -> bool`, `self.env_unsubscribe(name) -> bool`
 - Manager: `manager.env_set(name, value)`, `manager.env_get(name=None, default=None)`
 - `env_get()` with no key returns the full dict; with a key it distinguishes a stored `None` from an unset key (returns `default` only when unset).
-- `env_subscribe()` delivers updates in FIFO order and delivers the current value first before subsequent updates.
+- `env_subscribe()` delivers updates in FIFO order and delivers the current value first before subsequent updates. Exceptions in callbacks are logged and reported to `on_error(..., source="env:<key>")` while keeping the subscription active.
 
 ### Plugin RPC & Dynamic Orchestration
 - Call any public method on another plugin:
@@ -117,7 +118,7 @@ if __name__ == "__main__":
 
 ## Logging, Directories, and Monitoring
 
-- `PluginManager(work_dir=None, log_dir="logs", log_level=logging.INFO, display_logs=True, write_logs=True, timeout_request=5.0, timeout_start=10.0, timeout_initialize=30.0, timeout_debugger_attach=None)`
+- `PluginManager(work_dir=None, log_dir="logs", log_level=logging.INFO, display_logs=True, write_logs=True, timeout_request=5.0, timeout_start=10.0, timeout_initialize=30.0, timeout_debugger_attach=None)` (or pass `ManagerOptions(...).to_manager_kwargs()`).
 - Set `manager.work_dir` / `manager.log_dir` **before** loading any plugin; changes are rejected once loading starts.
 - Set `write_logs=False` to disable all log directory/file creation (useful in tests or ephemeral runs).
 - Plugins read their effective directory via `self.work_dir` and log via `self.logger`.
